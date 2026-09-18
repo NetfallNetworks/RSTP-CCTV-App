@@ -1096,15 +1096,6 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
         return START_STICKY
     }
 
-    /**
-     * The 16:9 height for a given capture width, rounded down to even (MediaCodec
-     * rejects odd dimensions).
-     */
-    private fun landscapeHeightFor(width: Int): Int {
-        val height = width * 9 / 16
-        return if (height % 2 == 0) height else height - 1
-    }
-
     private fun startStream() {
         try {
             if (!::rtspServerCamera.isInitialized) {
@@ -1191,14 +1182,20 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
 
                 // Captures the camera's own real, undistorted native mode (videoWidth x
                 // videoHeight, whatever the user picked -- these are all 4:3, the sensor's
-                // native aspect) and crops the corrected-orientation result down to a
-                // genuine 16:9 landscape output at the same horizontal resolution, via our
-                // RootEncoder fork's prepareVideoCropped(). See CAMERA_ROTATION_DEGREES's
-                // doc comment for why the previous approach (plain prepareVideo(), passing
-                // the same width/height straight through) could never produce landscape
-                // output at all.
-                val outputWidth = videoWidth
-                val outputHeight = landscapeHeightFor(videoWidth)
+                // native aspect) via our RootEncoder fork's prepareVideoCropped(). Output
+                // dims are set to the content's own natural post-rotation shape (width and
+                // height swapped, since correcting this sensor's orientation transposes it
+                // -- see CAMERA_ROTATION_DEGREES's doc comment), not a cropped landscape
+                // target: this sensor is this device's front-facing video-call camera,
+                // built for a person centered in frame, not a wide room view, so its full
+                // corrected-orientation capture is portrait-shaped. Matching the output
+                // dims to that exactly means zero cropping -- every captured pixel is kept
+                // -- at the cost of being taller than wide. (prepareVideoCropped() was
+                // tried with a genuinely cropped 16:9 output first; reverted -- it produced
+                // real landscape video but at the cost of discarding real picture data,
+                // which wasn't what was wanted here.)
+                val outputWidth = videoHeight
+                val outputHeight = videoWidth
                 if (rtspServerCamera.prepareVideoCropped(
                         videoWidth, videoHeight, outputWidth, outputHeight,
                         videoFps, bitrate, keyframeIntervalSeconds,
