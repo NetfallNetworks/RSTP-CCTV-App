@@ -61,12 +61,19 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
         private val ANIMAL_LABELS = setOf("cat", "dog", "bird", "horse", "sheep", "cow")
 
         /**
-         * Passed to prepareVideo()'s `rotation` parameter. The stream should show the same
-         * picture the camera itself takes -- same orientation, same proportions -- not a
-         * raw, unrotated sensor dump. 90 is the value confirmed, element by element, to
-         * match a native-camera-app ground-truth photo of this same scene.
+         * GL rotation of the camera texture, passed to our RootEncoder fork's
+         * prepareVideoCropped(). The stream should show the same picture the camera app
+         * takes -- same orientation, same proportions, same landscape 4:3 shape.
+         *
+         * Plain prepareVideo() can't do that here: for this camera it needs rotation=90
+         * to come out upright, and RootEncoder then declares the encoder transposed
+         * (768x1024) while drawing the still-landscape picture into it -- a 4:3 image
+         * squeezed to 75% width and stretched to 133% height. Measured on 2026-09-18
+         * against a native photo of the same scene, camera untouched in between: light-
+         * grid spacing scaled x0.675 horizontally vs x1.24 vertically, ~(3/4)^2, and the
+         * frame un-squashed to 4:3 matched the photo's proportions.
          */
-        private const val CAMERA_ROTATION_DEGREES = 90
+        private const val GL_CONTENT_ROTATION_DEGREES = 0
 
         /**
          * This camera's raw frames are mirrored left-right relative to the photo the native
@@ -74,7 +81,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
          * right in the stream). RootEncoder's Camera2 path applies no front-camera mirroring
          * of its own, so the reflection is in what this hardware delivers and the stock app
          * is correcting it; the stream has to correct it too. Applied in the encoder draw,
-         * i.e. in the output frame's own axes, after [CAMERA_ROTATION_DEGREES].
+         * i.e. in the output frame's own axes, after [GL_CONTENT_ROTATION_DEGREES].
          */
         private const val MIRROR_STREAM_HORIZONTALLY = true
     }
@@ -1156,20 +1163,14 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
 
                 rtspServerCamera.getGlInterface().setIsStreamHorizontalFlip(MIRROR_STREAM_HORIZONTALLY)
 
-                // Plain prepareVideo(), the original mechanism, verified correct against
-                // native-camera ground truth for weeks before today's prepareVideoCropped()
-                // detour. videoWidth/videoHeight passed as-is (not swapped): the rotation
-                // parameter transposes the encoded picture in hardware, so requesting the
-                // camera's native e.g. 1024x768 lands as a correctly-oriented, full-frame,
-                // undistorted 768x1024 output -- portrait shaped, not landscape (see
-                // CAMERA_ROTATION_DEGREES's doc comment for why landscape isn't available
-                // from this sensor without cropping real picture data, which isn't wanted
-                // here). This is deliberately the simplest possible path: no custom GL
-                // rotation matrix, no content-size crop math, nothing this app's own code
-                // could get subtly wrong -- just the library's own long-proven mechanism.
-                if (rtspServerCamera.prepareVideo(
-                        videoWidth, videoHeight, videoFps, bitrate, keyframeIntervalSeconds,
-                        CAMERA_ROTATION_DEGREES
+                // Camera capture, content and encoder output are all videoWidth x
+                // videoHeight -- the camera's own 4:3 landscape mode -- so nothing is
+                // cropped, padded or rescaled on one axis only. See
+                // GL_CONTENT_ROTATION_DEGREES for why this isn't plain prepareVideo().
+                if (rtspServerCamera.prepareVideoCropped(
+                        videoWidth, videoHeight, videoWidth, videoHeight,
+                        videoFps, bitrate, keyframeIntervalSeconds,
+                        GL_CONTENT_ROTATION_DEGREES, false
                     )
                 ) {
                     rtspServerCamera.startStream()
@@ -1193,10 +1194,10 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                         codec = "H264",
                         manualKbps = bitrateKbps.takeIf { it != AppPreferences.BITRATE_AUTO }
                     )
-                    if (rtspServerCamera.prepareVideo(
-                            videoWidth, videoHeight, videoFps,
-                            EncoderProfile.kbpsToBps(fallbackKbps), keyframeIntervalSeconds,
-                            CAMERA_ROTATION_DEGREES
+                    if (rtspServerCamera.prepareVideoCropped(
+                            videoWidth, videoHeight, videoWidth, videoHeight,
+                            videoFps, EncoderProfile.kbpsToBps(fallbackKbps), keyframeIntervalSeconds,
+                            GL_CONTENT_ROTATION_DEGREES, false
                         )
                     ) {
                          rtspServerCamera.startStream()
