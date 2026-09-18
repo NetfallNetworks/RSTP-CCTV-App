@@ -59,6 +59,14 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
 
         /** COCO labels treated as an "animal" event. */
         private val ANIMAL_LABELS = setOf("cat", "dog", "bird", "horse", "sheep", "cow")
+
+        /**
+         * Corrects this specific device's camera mount, which encodes 90 degrees CCW of
+         * upright. Confirmed empirically against a real frame pulled from the RTSP stream
+         * -- not a general Android sensor-orientation formula, since the library's
+         * headless capture path doesn't expose one to read here.
+         */
+        private const val CAMERA_ROTATION_DEGREES = 90
     }
 
     private lateinit var rtspServerCamera: RtspServerCamera2
@@ -1141,7 +1149,8 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                 // one takes the interval explicitly -- that extra argument is the whole
                 // reason for switching overloads, so keep the rotation argument last.
                 if (rtspServerCamera.prepareVideo(
-                        videoWidth, videoHeight, videoFps, bitrate, keyframeIntervalSeconds, 0
+                        videoWidth, videoHeight, videoFps, bitrate, keyframeIntervalSeconds,
+                        CAMERA_ROTATION_DEGREES
                     )
                 ) {
                     rtspServerCamera.startStream()
@@ -1167,7 +1176,8 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                     )
                     if (rtspServerCamera.prepareVideo(
                             videoWidth, videoHeight, videoFps,
-                            EncoderProfile.kbpsToBps(fallbackKbps), keyframeIntervalSeconds, 0
+                            EncoderProfile.kbpsToBps(fallbackKbps), keyframeIntervalSeconds,
+                            CAMERA_ROTATION_DEGREES
                         )
                     ) {
                          rtspServerCamera.startStream()
