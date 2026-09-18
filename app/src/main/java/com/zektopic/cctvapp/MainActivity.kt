@@ -47,7 +47,12 @@ class MainActivity : AppCompatActivity() {
     /** Counts taps on the version row; see [TapUnlock] for why it is time-windowed. */
     private val advancedUnlock = TapUnlock()
 
-    private val resolutions = arrayOf("640x480", "1280x720", "1920x1080", "Max")
+    // 1024x768 is 4:3, matching this camera's true native sensor aspect (confirmed via
+    // CameraCharacteristics) -- 1280x720 and 1920x1080 are 16:9 and cause a real vertical
+    // compression on this sensor's non-4:3 readout mode, not just a crop. 1280x960 (also
+    // 4:3) was tried and reliably crashes the hardware encoder -- 1024x768 is the largest
+    // 4:3 mode this specific encoder can actually hold.
+    private val resolutions = arrayOf("640x480", "1024x768", "1280x720", "1920x1080", "Max")
     private val codecs = arrayOf("H264", "H265", "AV1")
     private val overlayPositions = arrayOf("Top Left", "Top Right", "Bottom Left", "Bottom Right")
     private val overlaySizes = arrayOf("Small", "Medium", "Large")

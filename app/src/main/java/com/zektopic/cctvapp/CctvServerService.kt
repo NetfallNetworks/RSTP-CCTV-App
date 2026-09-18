@@ -32,7 +32,6 @@ import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import com.pedro.common.ConnectChecker
 import com.pedro.common.VideoCodec
-import com.pedro.encoder.input.gl.render.filters.RotationFilterRender
 import com.pedro.encoder.input.gl.render.filters.`object`.TextObjectFilterRender
 import com.pedro.encoder.utils.CodecUtil
 import com.pedro.library.view.OpenGlView
@@ -65,25 +64,30 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
          * This camera's raw capture is 90 degrees CCW of upright (confirmed against a real
          * frame pulled from the RTSP stream, and against SENSOR_ORIENTATION=0 -- the sensor
          * itself has no inherent rotation, so this is corrected in software, not hardware).
+         * Passed as prepareVideo()'s `rotation` parameter (hardware KEY_ROTATION), which
+         * physically transposes the encoded picture -- requesting e.g. 1280x960 lands as a
+         * correctly-oriented 960x1280 output. 90, not 270: confirmed correct against a
+         * native-camera ground-truth photo, compared element by element (which real-world
+         * object ends up above which).
          *
-         * Deliberately NOT passed as prepareVideo()'s `rotation` parameter: that parameter
-         * swaps the encoder's declared width/height for 90/270 (RootEncoder's Camera2Base
-         * treats it as "portrait vs landscape stream", not "degrees to rotate"), which is
-         * why that approach produced a correctly-oriented but portrait-shaped stream.
-         * Applied instead via RotationFilterRender (see applyRotationFilter()), the
-         * library author's own recommended fix for this exact problem
-         * (https://github.com/pedroSG94/RTSP-Server/issues/43) -- it rotates the content
-         * inside the encoder's still-landscape canvas instead of reshaping the canvas.
+         * Two alternatives tried and abandoned, both real dead ends, not just untidy:
+         * - A GL filter (RotationFilterRender), on the library author's own recommendation
+         *   for this exact problem (https://github.com/pedroSG94/RTSP-Server/issues/43).
+         *   It rotates content within a FIXED canvas shape, so fitting a rotated picture
+         *   into a canvas of the wrong aspect ratio required scaling it down, leaving most
+         *   of the frame as black padding.
+         * - Requesting the raw pre-rotation capture with width/height swapped, to try to
+         *   force a landscape-shaped transposed output. The requested portrait capture
+         *   size isn't one of this camera's real supported stream configurations, so it
+         *   fell back to some other, much smaller capture than intended (verified with
+         *   ffmpeg cropdetect: visible content shrank in both dimensions, not just one).
          *
-         * 270, not 90: RotationFilterRender.setRotationFixed()'s GL matrix rotation turned
-         * out to run the opposite direction from prepareVideo()'s hardware-encoder rotation
-         * (KEY_ROTATION) that CONTENT_ROTATION_DEGREES was originally calibrated against --
-         * 90 here produced a frame rotated 180 degrees from correct (upside down), confirmed
-         * against a real frame pulled from the stream and compared element-by-element
-         * against the native-camera ground-truth photo (upper cabinets were appearing at
-         * the bottom, near the floor, instead of the top).
+         * Currently NOT swapped -- output is portrait-shaped, full frame, undistorted.
+         * Landscape output remains an open problem; see the resolution investigation this
+         * constant is tied to for why 1280x720/1920x1080 (16:9) additionally distort the
+         * picture on this sensor and 4:3 sizes (1024x768, 1280x960) don't.
          */
-        private const val CONTENT_ROTATION_DEGREES = 270
+        private const val CAMERA_ROTATION_DEGREES = 90
     }
 
     private lateinit var rtspServerCamera: RtspServerCamera2
@@ -167,7 +171,6 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
     private var sensorManager: SensorManager? = null
     private var lightSensor: Sensor? = null
     private var textFilter: TextObjectFilterRender? = null
-    private var rotationFilter: RotationFilterRender? = null
     private lateinit var eventStore: EventStore
     private val retentionHandler = Handler(Looper.getMainLooper())
     private val retentionRunnable = object : Runnable {
@@ -1166,15 +1169,17 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                 // hard-codes a 2 second keyframe interval internally. The six-argument
                 // one takes the interval explicitly -- that extra argument is the whole
                 // reason for switching overloads, so keep the rotation argument last.
-                // rotation=0 here deliberately: the encoder keeps the configured
-                // landscape width/height, and CONTENT_ROTATION_DEGREES is applied
-                // separately as a GL filter (see applyRotationFilter()).
+                // videoWidth/videoHeight passed as-is (not swapped): hardware rotation
+                // transposes the encoded picture, so requesting e.g. 1280x960 lands as a
+                // correctly-oriented, full-frame, undistorted 960x1280 output -- portrait
+                // shaped, which is the tradeoff versus a landscape shape (see
+                // CAMERA_ROTATION_DEGREES for why the alternatives were worse).
                 if (rtspServerCamera.prepareVideo(
-                        videoWidth, videoHeight, videoFps, bitrate, keyframeIntervalSeconds, 0
+                        videoWidth, videoHeight, videoFps, bitrate, keyframeIntervalSeconds,
+                        CAMERA_ROTATION_DEGREES
                     )
                 ) {
                     rtspServerCamera.startStream()
-                    applyRotationFilter()
                     applyTimestampOverlay()
                     activeCodec = videoCodec
                     activeBitrateKbps = resolvedKbps
@@ -1197,11 +1202,11 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                     )
                     if (rtspServerCamera.prepareVideo(
                             videoWidth, videoHeight, videoFps,
-                            EncoderProfile.kbpsToBps(fallbackKbps), keyframeIntervalSeconds, 0
+                            EncoderProfile.kbpsToBps(fallbackKbps), keyframeIntervalSeconds,
+                            CAMERA_ROTATION_DEGREES
                         )
                     ) {
                          rtspServerCamera.startStream()
-                         applyRotationFilter()
                          applyTimestampOverlay()
                          // Record that THIS session fell back, but do NOT overwrite the
                          // user's stored choice. prepareVideo can fail transiently -- a
@@ -1226,41 +1231,6 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
         }
     }
 
-    /**
-     * Rotates the camera content upright inside the encoder's still-landscape canvas.
-     *
-     * Position 0 in the filter pipeline -- applyTimestampOverlay() takes position 1, so
-     * the timestamp text is drawn on top of the already-rotated frame and stays upright
-     * and correctly placed rather than being rotated along with the camera content.
-     */
-    private fun applyRotationFilter() {
-        if (!::rtspServerCamera.isInitialized) return
-        try {
-            val filter = rotationFilter ?: RotationFilterRender().also { rotationFilter = it }
-            filter.setRotationFixed(CONTENT_ROTATION_DEGREES, videoWidth, videoHeight, false)
-            setFilterAtPosition(0, filter)
-        } catch (e: Exception) {
-            android.util.Log.e("CctvServerService", "Failed to apply rotation filter", e)
-        }
-    }
-
-    /**
-     * setFilter(position, ...) throws IndexOutOfBoundsException when nothing occupies
-     * that position yet (a fresh stream start has an empty filter list) -- addFilter()
-     * is the correct call to actually insert a filter, setFilter() only replaces one
-     * already there. Every startStream() runs applyRotationFilter() then
-     * applyTimestampOverlay() in that order, so position 0 is always filled before
-     * position 1 is ever requested.
-     */
-    private fun setFilterAtPosition(position: Int, filter: com.pedro.encoder.input.gl.render.filters.BaseFilterRender) {
-        val glInterface = rtspServerCamera.getGlInterface()
-        if (position < glInterface.filtersCount()) {
-            glInterface.setFilter(position, filter)
-        } else {
-            glInterface.addFilter(filter)
-        }
-    }
-
     private fun applyTimestampOverlay() {
         if (!showTimestamp && !showDate) {
             timestampHandler.removeCallbacks(timestampRunnable)
@@ -1271,7 +1241,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
         try {
             val filter = TextObjectFilterRender()
             if (::rtspServerCamera.isInitialized) {
-                setFilterAtPosition(1, filter)
+                rtspServerCamera.getGlInterface().setFilter(filter)
             }
 
             val fontSize = getOverlayFontSize()
