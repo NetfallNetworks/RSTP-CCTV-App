@@ -64,30 +64,45 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
          * This camera's raw capture is 90 degrees CCW of upright (confirmed against a real
          * frame pulled from the RTSP stream, and against SENSOR_ORIENTATION=0 -- the sensor
          * itself has no inherent rotation, so this is corrected in software, not hardware).
-         * Passed as prepareVideo()'s `rotation` parameter (hardware KEY_ROTATION), which
-         * physically transposes the encoded picture -- requesting e.g. 1280x960 lands as a
-         * correctly-oriented 960x1280 output. 90, not 270: confirmed correct against a
-         * native-camera ground-truth photo, compared element by element (which real-world
-         * object ends up above which).
+         * No longer passed anywhere directly -- kept as the documented provenance for
+         * [GL_CONTENT_ROTATION_DEGREES], which is this same physical correction re-expressed
+         * for [prepareVideoCropped]. 90, not 270: confirmed correct against a native-camera
+         * ground-truth photo, compared element by element (which real-world object ends up
+         * above which).
          *
-         * Two alternatives tried and abandoned, both real dead ends, not just untidy:
-         * - A GL filter (RotationFilterRender), on the library author's own recommendation
-         *   for this exact problem (https://github.com/pedroSG94/RTSP-Server/issues/43).
-         *   It rotates content within a FIXED canvas shape, so fitting a rotated picture
-         *   into a canvas of the wrong aspect ratio required scaling it down, leaving most
-         *   of the frame as black padding.
-         * - Requesting the raw pre-rotation capture with width/height swapped, to try to
-         *   force a landscape-shaped transposed output. The requested portrait capture
-         *   size isn't one of this camera's real supported stream configurations, so it
-         *   fell back to some other, much smaller capture than intended (verified with
-         *   ffmpeg cropdetect: visible content shrank in both dimensions, not just one).
-         *
-         * Currently NOT swapped -- output is portrait-shaped, full frame, undistorted.
-         * Landscape output remains an open problem; see the resolution investigation this
-         * constant is tied to for why 1280x720/1920x1080 (16:9) additionally distort the
-         * picture on this sensor and 4:3 sizes (1024x768, 1280x960) don't.
+         * Historical note: passing this straight to prepareVideo()'s `rotation` parameter
+         * (the previous approach, before [prepareVideoCropped] existed) fixes orientation
+         * correctly but always produces a portrait-shaped, transposed output -- RootEncoder
+         * unconditionally swaps the encoder's declared width/height whenever this parameter
+         * is 90 or 270 (confirmed by reading VideoEncoder.prepareVideoEncoder() in the
+         * library's own source), which is geometrically why no combination of this single
+         * parameter and a requested capture size ever produced genuine landscape output:
+         * the parameter conflates "which way to rotate the picture" with "should the
+         * declared frame shape be transposed", and RootEncoder gives no way to ask for the
+         * first without the second. See [GL_CONTENT_ROTATION_DEGREES] for how that got
+         * decoupled.
          */
         private const val CAMERA_ROTATION_DEGREES = 90
+
+        /**
+         * The GL-space rotation passed to our RootEncoder fork's prepareVideoCropped() (see
+         * NetfallNetworks/RootEncoder, branch fix/decouple-camera-capture-size) -- a
+         * different numbering than [CAMERA_ROTATION_DEGREES], because it drives the camera
+         * texture's rotation directly (GlInterface.setRotation()) rather than going through
+         * prepareVideo()'s internal `rotation == 0 ? 270 : rotation - 90` offset. 0 is the
+         * value that offset produces when fed the old, confirmed-correct 90 -- i.e. this is
+         * the same physical correction as [CAMERA_ROTATION_DEGREES], just expressed in the
+         * new method's own units.
+         */
+        private const val GL_CONTENT_ROTATION_DEGREES = 0
+
+        /**
+         * True if correcting the camera's raw sideways capture to upright also transposes
+         * its shape (swaps which axis is longer) -- true for any 90/270-equivalent
+         * correction. Needed so prepareVideoCropped() can crop against the content's real,
+         * post-rotation aspect ratio rather than its raw pre-rotation one.
+         */
+        private const val CAMERA_CONTENT_TRANSPOSED = true
     }
 
     private lateinit var rtspServerCamera: RtspServerCamera2
@@ -1081,6 +1096,15 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
         return START_STICKY
     }
 
+    /**
+     * The 16:9 height for a given capture width, rounded down to even (MediaCodec
+     * rejects odd dimensions).
+     */
+    private fun landscapeHeightFor(width: Int): Int {
+        val height = width * 9 / 16
+        return if (height % 2 == 0) height else height - 1
+    }
+
     private fun startStream() {
         try {
             if (!::rtspServerCamera.isInitialized) {
@@ -1165,18 +1189,20 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                     android.util.Log.d("CctvServerService", "RTSP auth disabled")
                 }
 
-                // The five-argument overload is (w, h, fps, bitrate, rotation) and
-                // hard-codes a 2 second keyframe interval internally. The six-argument
-                // one takes the interval explicitly -- that extra argument is the whole
-                // reason for switching overloads, so keep the rotation argument last.
-                // videoWidth/videoHeight passed as-is (not swapped): hardware rotation
-                // transposes the encoded picture, so requesting e.g. 1280x960 lands as a
-                // correctly-oriented, full-frame, undistorted 960x1280 output -- portrait
-                // shaped, which is the tradeoff versus a landscape shape (see
-                // CAMERA_ROTATION_DEGREES for why the alternatives were worse).
-                if (rtspServerCamera.prepareVideo(
-                        videoWidth, videoHeight, videoFps, bitrate, keyframeIntervalSeconds,
-                        CAMERA_ROTATION_DEGREES
+                // Captures the camera's own real, undistorted native mode (videoWidth x
+                // videoHeight, whatever the user picked -- these are all 4:3, the sensor's
+                // native aspect) and crops the corrected-orientation result down to a
+                // genuine 16:9 landscape output at the same horizontal resolution, via our
+                // RootEncoder fork's prepareVideoCropped(). See CAMERA_ROTATION_DEGREES's
+                // doc comment for why the previous approach (plain prepareVideo(), passing
+                // the same width/height straight through) could never produce landscape
+                // output at all.
+                val outputWidth = videoWidth
+                val outputHeight = landscapeHeightFor(videoWidth)
+                if (rtspServerCamera.prepareVideoCropped(
+                        videoWidth, videoHeight, outputWidth, outputHeight,
+                        videoFps, bitrate, keyframeIntervalSeconds,
+                        GL_CONTENT_ROTATION_DEGREES, CAMERA_CONTENT_TRANSPOSED
                     )
                 ) {
                     rtspServerCamera.startStream()
@@ -1200,10 +1226,10 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                         codec = "H264",
                         manualKbps = bitrateKbps.takeIf { it != AppPreferences.BITRATE_AUTO }
                     )
-                    if (rtspServerCamera.prepareVideo(
-                            videoWidth, videoHeight, videoFps,
-                            EncoderProfile.kbpsToBps(fallbackKbps), keyframeIntervalSeconds,
-                            CAMERA_ROTATION_DEGREES
+                    if (rtspServerCamera.prepareVideoCropped(
+                            videoWidth, videoHeight, outputWidth, outputHeight,
+                            videoFps, EncoderProfile.kbpsToBps(fallbackKbps), keyframeIntervalSeconds,
+                            GL_CONTENT_ROTATION_DEGREES, CAMERA_CONTENT_TRANSPOSED
                         )
                     ) {
                          rtspServerCamera.startStream()

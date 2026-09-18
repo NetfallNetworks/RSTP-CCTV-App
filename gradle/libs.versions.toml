@@ -10,8 +10,18 @@ constraintlayout = "2.1.4"
 recyclerview = "1.3.2"
 # rtspServer pins rootEncoder transitively -- bump both together.
 # 1.4.2 / 2.8.0 require compileSdk 37, which AGP 9.0.1 does not support.
-rootEncoder = "2.7.2"
-rtspServer = "1.4.1"
+#
+# Both currently point at NetfallNetworks forks, not upstream pedroSG94, pinned to
+# specific commits rather than tags (JitPack builds any public commit SHA directly):
+# - RootEncoder @ fix/decouple-camera-capture-size adds prepareVideoCropped(), used by
+#   CctvServerService to get genuine, undistorted 16:9 landscape video from this
+#   device's 4:3-native sensor (cropped, not stretched or padded).
+# - RTSP-Server @ fix/depend-on-patched-rootencoder just repoints its own RootEncoder
+#   dependency at the fork above (no source changes -- RtspServerCamera2 only extends
+#   Camera2Base, it doesn't touch camera/GL internals).
+# Both branches are otherwise identical to the tags below.
+rootEncoder = "a0b981b48a7ea57cdca9bb5423a31c623bb15fb1"
+rtspServer = "7cf2d6b084bfab050c486fd43923c096ef567d17"
 nanohttpd = "2.3.1"
 # tensorflow-lite-task-vision was frozen at 0.4.4 (Jul 2023) and its
 # libtask_vision_jni.so has 4 KB LOAD alignment, which fails Android 16 KB
@@ -32,8 +42,8 @@ androidx-appcompat = { group = "androidx.appcompat", name = "appcompat", version
 material = { group = "com.google.android.material", name = "material", version.ref = "material" }
 androidx-constraintlayout = { group = "androidx.constraintlayout", name = "constraintlayout", version.ref = "constraintlayout" }
 androidx-recyclerview = { group = "androidx.recyclerview", name = "recyclerview", version.ref = "recyclerview" }
-rootencoder-library = { group = "com.github.pedroSG94.RootEncoder", name = "library", version.ref = "rootEncoder" }
-rtsp-server = { group = "com.github.pedroSG94", name = "RTSP-Server", version.ref = "rtspServer" }
+rootencoder-library = { group = "com.github.NetfallNetworks.RootEncoder", name = "library", version.ref = "rootEncoder" }
+rtsp-server = { group = "com.github.NetfallNetworks", name = "RTSP-Server", version.ref = "rtspServer" }
 nanohttpd = { group = "org.nanohttpd", name = "nanohttpd", version.ref = "nanohttpd" }
 json = { group = "org.json", name = "json", version.ref = "json" }
 mediapipe-tasks-vision = { group = "com.google.mediapipe", name = "tasks-vision", version.ref = "mediapipeTasksVision" }
