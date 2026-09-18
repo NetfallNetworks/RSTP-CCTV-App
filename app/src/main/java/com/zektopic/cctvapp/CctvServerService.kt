@@ -74,8 +74,16 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
          * library author's own recommended fix for this exact problem
          * (https://github.com/pedroSG94/RTSP-Server/issues/43) -- it rotates the content
          * inside the encoder's still-landscape canvas instead of reshaping the canvas.
+         *
+         * 270, not 90: RotationFilterRender.setRotationFixed()'s GL matrix rotation turned
+         * out to run the opposite direction from prepareVideo()'s hardware-encoder rotation
+         * (KEY_ROTATION) that CONTENT_ROTATION_DEGREES was originally calibrated against --
+         * 90 here produced a frame rotated 180 degrees from correct (upside down), confirmed
+         * against a real frame pulled from the stream and compared element-by-element
+         * against the native-camera ground-truth photo (upper cabinets were appearing at
+         * the bottom, near the floor, instead of the top).
          */
-        private const val CONTENT_ROTATION_DEGREES = 90
+        private const val CONTENT_ROTATION_DEGREES = 270
     }
 
     private lateinit var rtspServerCamera: RtspServerCamera2
