@@ -67,6 +67,16 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
          * match a native-camera-app ground-truth photo of this same scene.
          */
         private const val CAMERA_ROTATION_DEGREES = 90
+
+        /**
+         * This camera's raw frames are mirrored left-right relative to the photo the native
+         * camera app takes of the same scene (a door on the left in the photo sat on the
+         * right in the stream). RootEncoder's Camera2 path applies no front-camera mirroring
+         * of its own, so the reflection is in what this hardware delivers and the stock app
+         * is correcting it; the stream has to correct it too. Applied in the encoder draw,
+         * i.e. in the output frame's own axes, after [CAMERA_ROTATION_DEGREES].
+         */
+        private const val MIRROR_STREAM_HORIZONTALLY = true
     }
 
     private lateinit var rtspServerCamera: RtspServerCamera2
@@ -1143,6 +1153,8 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                     rtspServerCamera.getStreamClient().setAuthorization("", "")
                     android.util.Log.d("CctvServerService", "RTSP auth disabled")
                 }
+
+                rtspServerCamera.getGlInterface().setIsStreamHorizontalFlip(MIRROR_STREAM_HORIZONTALLY)
 
                 // Plain prepareVideo(), the original mechanism, verified correct against
                 // native-camera ground truth for weeks before today's prepareVideoCropped()
