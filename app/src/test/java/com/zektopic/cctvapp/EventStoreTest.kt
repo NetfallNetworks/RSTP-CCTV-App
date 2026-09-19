@@ -243,4 +243,54 @@ class EventStoreTest {
         assertEquals("test", event.type)
         assertNotNull(eventStore.getEventSnapshotFile(event.id))
     }
+
+    // --- clips ---
+
+    /** Creates an event and a clip file of [clipBytes] for it; returns the event id. */
+    private fun eventWithClip(eventStore: EventStore, clipBytes: Int): String {
+        val event = eventStore.createDetectionEvent("person", 0.9, jpeg)
+        val clip = eventStore.clipFileFor(event.id)
+        clip.writeBytes(ByteArray(clipBytes))
+        assertTrue(eventStore.attachClip(event.id, clip, event.startTimeMs + 15_000))
+        // startTimeMs orders eviction; keep consecutive events distinct.
+        Thread.sleep(3)
+        return event.id
+    }
+
+    @Test
+    fun `an attached clip is served and marked on the event`() {
+        val eventStore = store()
+        val id = eventWithClip(eventStore, 1_000)
+        assertNotNull(eventStore.getEventClipFile(id))
+        val json = org.json.JSONObject(eventStore.getEventAsJson(id)!!)
+        assertTrue(json.getBoolean("has_clip"))
+        assertEquals(json.getLong("start_time") + 15_000, json.getLong("end_time"))
+    }
+
+    @Test
+    fun `a clip for an event evicted mid-recording is deleted`() {
+        val eventStore = store()
+        val orphan = File(mediaDir(), "gone_clip.mp4").apply { writeBytes(ByteArray(10)) }
+        assertFalse(eventStore.attachClip("gone", orphan, 0))
+        assertFalse(orphan.exists())
+    }
+
+    @Test
+    fun `media over the size cap evicts the oldest events first`() {
+        val eventStore = EventStore(tempFolder.root, maxMediaBytes = 2_500)
+        val oldest = eventWithClip(eventStore, 1_000)
+        val middle = eventWithClip(eventStore, 1_000)
+        val newest = eventWithClip(eventStore, 1_000)
+
+        val remaining = eventStore.listRecentEvents(10).map { it.id }
+        assertEquals(listOf(newest, middle), remaining)
+        assertFalse(eventStore.clipFileFor(oldest).exists())
+    }
+
+    @Test
+    fun `the newest event is kept even if its clip alone is over the cap`() {
+        val eventStore = EventStore(tempFolder.root, maxMediaBytes = 500)
+        val id = eventWithClip(eventStore, 1_000)
+        assertNotNull(eventStore.getEventClipFile(id))
+    }
 }

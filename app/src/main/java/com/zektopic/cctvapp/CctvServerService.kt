@@ -206,6 +206,20 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
     private val detectionExecutor = Executors.newSingleThreadExecutor()
     /** Separate from [detectionExecutor]: captioning is slow and must not stall detection. */
     private val captionExecutor = Executors.newSingleThreadExecutor()
+
+    /**
+     * Event clips, cut from the stream encoder's own output. A finished clip arrives on the
+     * encoder thread, so its bookkeeping is handed off rather than done there.
+     */
+    private val clipRecorder = ClipRecorder { clip ->
+        val attach = Runnable { eventStore.attachClip(clip.eventId, clip.file, System.currentTimeMillis()) }
+        try {
+            detectionExecutor.execute(attach)
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            // Service shutting down: the stream stopping is what finished this clip.
+            attach.run()
+        }
+    }
     private val motionDetector = MotionDetector()
     private lateinit var liteRtObjectDetector: LiteRtObjectDetector
     private var eventCaptioner: EventCaptioner? = null
@@ -217,8 +231,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
 
     private val snapshotRunnable = object : Runnable {
         override fun run() {
-            val streaming = ::rtspServerCamera.isInitialized &&
-                rtspServerCamera.isStreaming && isSurfaceCreated
+            val streaming = ::rtspServerCamera.isInitialized && rtspServerCamera.isStreaming
 
             // Capturing + JPEG-encoding twice a second around the clock is the single
             // biggest battery cost in the app, and most of the time nothing consumes the
@@ -779,10 +792,18 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
         return ipv4Address ?: "0.0.0.0"
     }
 
+    /**
+     * Grabs the stream's own picture, for the dashboard and for detection.
+     *
+     * From the headless stream pipeline, not openGlView: that view's surface only exists
+     * while this app is on screen, so with Fully Kiosk in front -- the normal state on the
+     * patio -- snapshots, and with them all detection, silently stopped. This is also
+     * exactly what RTSP clients see: same orientation, same mirror correction.
+     */
     private fun takeSnapshot() {
-        if (!isSurfaceCreated || !::openGlView.isInitialized || !openGlView.holder.surface.isValid) return
+        if (!::rtspServerCamera.isInitialized || !rtspServerCamera.isStreaming) return
         try {
-            openGlView.takePhoto { bitmap -> 
+            rtspServerCamera.getGlInterface().takePhoto { bitmap ->
                 val stream = ByteArrayOutputStream()
                 bitmap.compress(Bitmap.CompressFormat.JPEG, snapshotJpegQuality, stream)
                 val jpeg = stream.toByteArray()
@@ -834,13 +855,13 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                     val detections = liteRtObjectDetector.detect(bitmap)
 
                     detections.filter { it.label == "person" }.maxByOrNull { it.score }?.let {
-                        maybeCreateDetectionEvent("person", it.score.toDouble(), snapshotJpeg)
+                        recordClip("person", it.score.toDouble(), snapshotJpeg)
                     }
 
                     detections
                         .filter { it.label in ANIMAL_LABELS }
                         .maxByOrNull { it.score }
-                        ?.let { maybeCreateDetectionEvent("animal", it.score.toDouble(), snapshotJpeg) }
+                        ?.let { recordClip("animal", it.score.toDouble(), snapshotJpeg) }
                 }
             } catch (e: Exception) {
                 android.util.Log.e("CctvServerService", "Detection pipeline failed", e)
@@ -849,6 +870,28 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                 // significant and shows up as dropped frames on low-end devices.
                 bitmap?.recycle()
             }
+        }
+    }
+
+    /**
+     * A person or animal: start a clip, or keep the open one running.
+     *
+     * Only people and animals record -- outdoors, plain motion fires on leaves, shadows,
+     * rain and headlights, and would bury the real clips. One event per clip, created when
+     * the clip opens; detections while it is open only extend it, so there is no cooldown
+     * here. With no clip possible (stream just started, muxer failure) this falls back to
+     * the plain snapshot event.
+     */
+    private fun recordClip(type: String, score: Double, snapshotJpeg: ByteArray) {
+        val result = clipRecorder.trigger {
+            val event = eventStore.createDetectionEvent(type, score, snapshotJpeg)
+            // Keeps the fallback below from adding a second event if the muxer then fails.
+            lastEventMsByType[type] = System.currentTimeMillis()
+            captionEventInBackground(event.id, snapshotJpeg)
+            ClipRecorder.ClipTarget(event.id, eventStore.clipFileFor(event.id))
+        }
+        if (result == ClipRecorder.Trigger.UNAVAILABLE) {
+            maybeCreateDetectionEvent(type, score, snapshotJpeg)
         }
     }
 
@@ -976,7 +1019,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
         // openGlView's surface, so it keeps running while another app (Fully Kiosk) holds
         // the screen. openGlView still exists for the dashboard's own JPEG snapshots.
         if (!::rtspServerCamera.isInitialized) {
-             rtspServerCamera = RtspServerCamera2(this, this, 8554)
+             rtspServerCamera = newRtspServerCamera()
         }
 
         // If already streaming, check if we need to restart due to config change
@@ -1077,10 +1120,14 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
         return START_STICKY
     }
 
+    /** Headless, so the stream survives Fully Kiosk holding the screen; see onStartCommand. */
+    private fun newRtspServerCamera(): RtspServerCamera2 =
+        RtspServerCamera2(this, this, 8554).also { it.setRecordController(clipRecorder) }
+
     private fun startStream() {
         try {
             if (!::rtspServerCamera.isInitialized) {
-                rtspServerCamera = RtspServerCamera2(this, this, 8554)
+                rtspServerCamera = newRtspServerCamera()
             }
 
             if (!rtspServerCamera.isStreaming) {
@@ -1396,10 +1443,9 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
-        // Only the dashboard's JPEG snapshot path (takeSnapshot -> openGlView.takePhoto)
-        // needs this view's surface. The RTSP stream is headless (see the RtspServerCamera2
-        // construction in onStartCommand/startStream) and must keep running when another
-        // app, e.g. Fully Kiosk, takes the screen and tears this overlay's surface down.
+        // Nothing needs this view's surface any more: the RTSP stream and the snapshots
+        // (see takeSnapshot) both come from the headless pipeline, and must keep running
+        // when another app, e.g. Fully Kiosk, takes the screen and tears this down.
         isSurfaceCreated = false
     }
 
