@@ -49,7 +49,10 @@ class LiteRtObjectDetector(
                 )
                 .setRunningMode(RunningMode.IMAGE)
                 .setMaxResults(5)
-                .setScoreThreshold(0.45f)
+                // Low on purpose: these labels only tag clips (motion already records
+                // them), so a wrong "animal" costs a glance while a missed one hides the
+                // clip you were looking for. Small, dim, partly hidden animals score low.
+                .setScoreThreshold(0.30f)
                 .build()
             detector = ObjectDetector.createFromOptions(context, options)
             true

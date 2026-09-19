@@ -3,10 +3,11 @@ package com.zektopic.cctvapp
 /**
  * When an event clip stops.
  *
- * A clip runs until [postRollUs] after the most recent detection, so someone who stays in
- * view keeps one clip going rather than producing a string of short ones -- but never
- * past [maxClipUs] from its first frame, so a person standing on the patio all evening
- * cannot grow a single file without bound. All times are encoder presentation times.
+ * A clip runs until [postRollUs] after the most recent detection, so an animal that
+ * moves, pauses and moves again keeps one clip going rather than producing a string of
+ * short ones. A single file is capped at [maxClipUs] from its first frame; when the cap,
+ * not the post-roll, is what ends it, [cutShort] is true and the recorder rolls straight
+ * into a continuation clip. All times are encoder presentation times.
  */
 class ClipWindow(
     private val postRollUs: Long,
@@ -14,14 +15,18 @@ class ClipWindow(
     val startUs: Long,
     triggeredAtUs: Long
 ) {
-    var endAtUs: Long = cap(triggeredAtUs + postRollUs)
+    /** Where the clip would end with no cap. */
+    var requestedEndUs: Long = triggeredAtUs + postRollUs
         private set
 
+    val endAtUs: Long get() = minOf(requestedEndUs, startUs + maxClipUs)
+
+    /** True if the cap, rather than a quiet post-roll, is what ends this clip. */
+    val cutShort: Boolean get() = requestedEndUs > endAtUs
+
     fun extend(triggeredAtUs: Long) {
-        endAtUs = maxOf(endAtUs, cap(triggeredAtUs + postRollUs))
+        requestedEndUs = maxOf(requestedEndUs, triggeredAtUs + postRollUs)
     }
 
     fun isOver(ptsUs: Long): Boolean = ptsUs > endAtUs
-
-    private fun cap(us: Long): Long = minOf(us, startUs + maxClipUs)
 }
