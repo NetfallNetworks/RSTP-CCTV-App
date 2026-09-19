@@ -242,6 +242,18 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                 type, prior?.score, currentSnapshot.get(), prior?.tags?.ifEmpty { null } ?: listOf(type), recording = true
             )
             ClipRecorder.ClipTarget(event.id, eventStore.clipFileFor(event.id))
+        },
+        // A clip that never started or never finalised otherwise leaves its event stuck
+        // reporting recording=true -- and /events/<id>/archived stuck at 409 -- until the
+        // next process restart runs recoverInterrupted(). Clear it immediately instead.
+        onClipFailed = { id ->
+            clipTimelines.remove(id)
+            val clear = Runnable { eventStore.clearRecording(id) }
+            try {
+                detectionExecutor.execute(clear)
+            } catch (_: java.util.concurrent.RejectedExecutionException) {
+                clear.run()
+            }
         }
     )
     /**
@@ -1013,6 +1025,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
         if (autoPause.isPaused && clipRecorder.activeEventId == null) return
         val result = clipRecorder.trigger {
             val event = eventStore.createDetectionEvent(type, score, snapshotJpeg, recording = true)
+            // Keeps the fallback below from adding a second event if the muxer then fails.
             lastEventMsByType[type] = System.currentTimeMillis()
             captionEventInBackground(event.id, snapshotJpeg)
             ClipRecorder.ClipTarget(event.id, eventStore.clipFileFor(event.id))
