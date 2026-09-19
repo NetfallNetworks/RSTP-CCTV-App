@@ -4,6 +4,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ClipTimelineTest {
@@ -39,5 +40,27 @@ class ClipTimelineTest {
     @Test
     fun `no activity means no activity object`() {
         assertNull(ClipTimeline().activityJson())
+    }
+
+    @Test
+    fun `a sample far in the future is ignored and the array stays small`() {
+        val t = ClipTimeline()
+        t.addActivity(0, 0.1)
+        t.addActivity(30L * 24 * 60 * 60 * 1000, 0.9) // +30 days: an NTP jump, not real activity
+        val a = JSONObject(t.activityJson()!!)
+        val permille = a.getJSONArray("permille")
+        // Only the first, in-bounds sample landed; the far-future one (index ~2.59M) was
+        // ignored rather than padding permille out to it.
+        assertEquals(1, permille.length())
+        assertTrue(permille.length() < ClipTimeline.MAX_ACTIVITY_SAMPLES)
+    }
+
+    @Test
+    fun `detection score and box values are rounded to 3 decimals`() {
+        val t = ClipTimeline()
+        t.addDetection(0, "person", 0.1f.toDouble(), listOf(0.1f))
+        val d = JSONArray(t.detectionsJson()).getJSONObject(0)
+        assertEquals(0.1, d.getDouble("score"), 0.0)
+        assertEquals(0.1, d.getJSONArray("box").getDouble(0), 0.0)
     }
 }

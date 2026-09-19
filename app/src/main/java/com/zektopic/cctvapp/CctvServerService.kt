@@ -212,6 +212,18 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
     private val autoPause = AutoPause()
     /** The open clip's timeline, by event id; detection thread writes, encoder thread takes on finish. */
     private val clipTimelines = java.util.concurrent.ConcurrentHashMap<String, ClipTimeline>()
+    /**
+     * Tags of the active clip's event, by event id -- so RecordApi.state()'s 2 s poll
+     * doesn't do a full events.json parse (eventStore.getEvent) just to report them.
+     * Seeded wherever a clip's event is created, kept in step by [markTagApplied], and
+     * removed alongside [clipTimelines] when the clip finishes, fails or is discarded.
+     */
+    private val clipTagsCache = java.util.concurrent.ConcurrentHashMap<String, MutableSet<String>>()
+
+    /** Seeds [clipTagsCache] for a just-created event, from its own starting tags. */
+    private fun seedTagsCache(event: DetectionEvent) {
+        clipTagsCache[event.id] = java.util.concurrent.ConcurrentHashMap.newKeySet<String>().apply { addAll(event.tags) }
+    }
 
     /**
      * Event clips, cut from the stream encoder's own output. A finished clip arrives on the
@@ -220,6 +232,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
     private val clipRecorder = ClipRecorder(
         onClipFinished = { clip ->
             val timeline = clipTimelines.remove(clip.eventId)
+            clipTagsCache.remove(clip.eventId)
             val attach = Runnable {
                 eventStore.attachClip(
                     clip.eventId, clip.file, System.currentTimeMillis(), clip.durationUs / 1000,
@@ -241,6 +254,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             val event = eventStore.createDetectionEvent(
                 type, prior?.score, currentSnapshot.get(), prior?.tags?.ifEmpty { null } ?: listOf(type), recording = true
             )
+            seedTagsCache(event)
             ClipRecorder.ClipTarget(event.id, eventStore.clipFileFor(event.id))
         },
         // A clip that never started or never finalised otherwise leaves its event stuck
@@ -248,6 +262,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
         // next process restart runs recoverInterrupted(). Clear it immediately instead.
         onClipFailed = { id ->
             clipTimelines.remove(id)
+            clipTagsCache.remove(id)
             val clear = Runnable { eventStore.clearRecording(id) }
             try {
                 detectionExecutor.execute(clear)
@@ -270,9 +285,14 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
         }
     }
 
-    /** Thread-safe add to [clipTagsApplied]; see its KDoc. */
-    private fun markTagApplied(id: String, tag: String): Boolean =
-        synchronized(clipTagsApplied) { clipTagsApplied.add(id to tag) }
+    /** Thread-safe add to [clipTagsApplied]; see its KDoc. Keeps [clipTagsCache] in step. */
+    private fun markTagApplied(id: String, tag: String): Boolean {
+        val added = synchronized(clipTagsApplied) { clipTagsApplied.add(id to tag) }
+        if (added) {
+            clipTagsCache.getOrPut(id) { java.util.concurrent.ConcurrentHashMap.newKeySet() }.add(tag)
+        }
+        return added
+    }
     private val motionDetector = MotionDetector()
     private lateinit var liteRtObjectDetector: LiteRtObjectDetector
     private var eventCaptioner: EventCaptioner? = null
@@ -290,7 +310,12 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             val o = org.json.JSONObject()
             o.put("state", if (s == null) "idle" else "recording")
             o.put("event_id", s?.eventId ?: org.json.JSONObject.NULL)
-            o.put("tags", org.json.JSONArray(s?.let { eventStore.getEvent(it.eventId)?.tags } ?: emptyList<String>()))
+            // clipTagsCache holds the active clip's tags without a full events.json parse;
+            // eventStore.getEvent is only the fallback for an id the cache missed.
+            val tags = s?.eventId?.let { id ->
+                clipTagsCache[id]?.toList() ?: eventStore.getEvent(id)?.tags
+            } ?: emptyList<String>()
+            o.put("tags", org.json.JSONArray(tags))
             o.put("elapsed_ms", s?.elapsedMs ?: org.json.JSONObject.NULL)
             o.put("hold_remaining_ms", s?.holdRemainingMs ?: org.json.JSONObject.NULL)
             o.put("ends_in_ms", s?.endsInMs ?: org.json.JSONObject.NULL)
@@ -301,6 +326,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
         override fun start(minutes: Int): String {
             val result = clipRecorder.startManual(minutes.coerceIn(1, 30)) {
                 val event = eventStore.createDetectionEvent("manual", null, currentSnapshot.get(), recording = true)
+                seedTagsCache(event)
                 ClipRecorder.ClipTarget(event.id, eventStore.clipFileFor(event.id))
             }
             result.eventId?.let { if (markTagApplied(it, "manual")) eventStore.tagEvent(it, "manual") }
@@ -324,6 +350,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             if (pauseAutoMinutes > 0) autoPause.pauseFor(pauseAutoMinutes)
             clipRecorder.discard()?.let { id ->
                 clipTimelines.remove(id)
+                clipTagsCache.remove(id)
                 eventStore.discardEvent(id)
             }
             return state()
@@ -966,6 +993,14 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
 
         try {
             detectionExecutor.execute {
+                // A detection racing a clip's end can recreate a timeline/tags entry for a
+                // finished id that nothing else removes -- the finished clip's own entry was
+                // already consumed in onClipFinished/onClipFailed on this same executor, so
+                // anything left over for a different id is stale. Safe to prune unconditionally.
+                val activeId = clipRecorder.activeEventId
+                clipTimelines.keys.removeIf { it != activeId }
+                clipTagsCache.keys.removeIf { it != activeId }
+
                 var bitmap: Bitmap? = null
                 try {
                     bitmap = decodeForAnalysis(snapshotJpeg) ?: return@execute
@@ -1028,6 +1063,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             // Keeps the fallback below from adding a second event if the muxer then fails.
             lastEventMsByType[type] = System.currentTimeMillis()
             captionEventInBackground(event.id, snapshotJpeg)
+            seedTagsCache(event)
             ClipRecorder.ClipTarget(event.id, eventStore.clipFileFor(event.id))
         }
         val id = result.eventId
@@ -1600,15 +1636,13 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
         snapshotHandler.removeCallbacks(snapshotRunnable)
         retentionHandler.removeCallbacks(retentionRunnable)
         timestampHandler.removeCallbacks(timestampRunnable)
-        detectionExecutor.shutdownNow()
-        captionExecutor.shutdownNow()
-        eventCaptioner?.close()
-        if (::liteRtObjectDetector.isInitialized) liteRtObjectDetector.close()
-        sensorManager?.unregisterListener(lightSensorListener)
-        
-        webServer.stop()
-        
-        if (::rtspServerCamera.isInitialized) { 
+
+        // Stop the stream -- and with it, any open clip (ClipRecorder.resetFormats() ends
+        // it synchronously via onClipFinished/onClipFailed) -- before touching
+        // detectionExecutor. Shutting the executor down first dropped its queued
+        // attach/clear Runnables, so recoverInterrupted() on the next start found a
+        // complete clip's event still reporting recording=true and deleted it.
+        if (::rtspServerCamera.isInitialized) {
             try {
                 if (rtspServerCamera.isStreaming) {
                     rtspServerCamera.stopStream()
@@ -1617,7 +1651,23 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                 e.printStackTrace()
             }
         }
-        
+
+        detectionExecutor.shutdown()
+        try {
+            if (!detectionExecutor.awaitTermination(2, java.util.concurrent.TimeUnit.SECONDS)) {
+                detectionExecutor.shutdownNow()
+            }
+        } catch (e: InterruptedException) {
+            detectionExecutor.shutdownNow()
+            Thread.currentThread().interrupt()
+        }
+        captionExecutor.shutdownNow()
+        eventCaptioner?.close()
+        if (::liteRtObjectDetector.isInitialized) liteRtObjectDetector.close()
+        sensorManager?.unregisterListener(lightSensorListener)
+
+        webServer.stop()
+
         if (::openGlView.isInitialized) {
             try {
                 windowManager.removeView(openGlView)
@@ -1625,7 +1675,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                 e.printStackTrace()
             }
         }
-        
+
         stopForeground(STOP_FOREGROUND_REMOVE)
     }
 
