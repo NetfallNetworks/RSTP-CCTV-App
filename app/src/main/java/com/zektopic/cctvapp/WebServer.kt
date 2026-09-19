@@ -136,7 +136,7 @@ class WebServer(
         if (uri.startsWith("/record/")) {
             if (session.method != Method.POST) return json(Response.Status.METHOD_NOT_ALLOWED, """{"error":"POST"}""")
             val minutes = session.parameters["minutes"]?.firstOrNull()?.toIntOrNull() ?: 15
-            val pauseAuto = session.parameters["pauseAuto"]?.firstOrNull()?.toIntOrNull() ?: 0
+            val pauseAuto = (session.parameters["pauseAuto"]?.firstOrNull()?.toIntOrNull() ?: 0).coerceIn(0, 60)
             val body = when (uri) {
                 "/record/start" -> recordApi.start(minutes)
                 "/record/hold" -> recordApi.hold(minutes)
