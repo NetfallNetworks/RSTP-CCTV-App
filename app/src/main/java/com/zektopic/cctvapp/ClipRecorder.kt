@@ -200,7 +200,7 @@ class ClipRecorder(
             Log.e(TAG, "Rollover after ${previous.eventId} failed", e)
             null
         } ?: return
-        startClip(target, window.requestedEndUs - postRollUs)
+        startClip(target, window.detectionEndUs - postRollUs)
     }
 
     /** Returns the finished clip, or null if it could not be finalised. Caller must hold [lock]. */
