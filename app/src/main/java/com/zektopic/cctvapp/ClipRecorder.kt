@@ -38,8 +38,10 @@ class ClipRecorder(
     /**
      * The event behind a clip that failed to start (trigger/startManual/rollover) or
      * finalise (finish, keep=true only -- Discard is intentional and the caller already
-     * has the event id from [discard]'s return). Called from inside [lock]; must not call
-     * back into this ClipRecorder. Default keeps other call sites (tests) compiling.
+     * has the event id from [discard]'s return). Also called with a [FinishedClip.continued]
+     * part's own id when [onRollover] declined or threw, since that recording has now ended
+     * after all. Called from inside [lock]; must not call back into this ClipRecorder.
+     * Default keeps other call sites (tests) compiling.
      */
     private val onClipFailed: (eventId: String) -> Unit = {}
 ) : RecordController {
@@ -63,7 +65,16 @@ class ClipRecorder(
     }
 
     class ClipTarget(val eventId: String, val file: File)
-    class FinishedClip(val eventId: String, val file: File, val durationUs: Long, val clipStartMs: Long)
+    /**
+     * [continued]: this part ended at the per-file cap and a continuation part is about to
+     * be opened, so the recording has not ended. If that continuation cannot be opened,
+     * [onClipFailed] is called -- with the continuation's id when its event exists, or with
+     * this part's own id when [onRollover] declined -- so the recording is still ended.
+     */
+    class FinishedClip(
+        val eventId: String, val file: File, val durationUs: Long, val clipStartMs: Long,
+        val continued: Boolean = false
+    )
 
     enum class Outcome {
         /** A new clip opened; the caller's target is now being written. */
@@ -224,8 +235,8 @@ class ClipRecorder(
             buffer.add(frame)
             val clip = active ?: return
             if (clip.window.isOver(frame.ptsUs)) {
-                val finished = finish(clip)
-                if (finished != null && clip.window.cutShort) rollOver(finished, clip.window)
+                val finished = finish(clip, continued = clip.window.cutShort)
+                if (finished != null && finished.continued) rollOver(finished, clip.window)
                 return
             }
             try {
@@ -279,7 +290,13 @@ class ClipRecorder(
         } catch (e: Exception) {
             Log.e(TAG, "Rollover after ${previous.eventId} failed", e)
             null
-        } ?: return
+        }
+        if (target == null) {
+            // No continuation after all: [previous] was reported continued (held), so it
+            // must be reported again or its recording would never end.
+            onClipFailed(previous.eventId)
+            return
+        }
         if (!startClip(target, window.detectionEndUs - postRollUs, window.holdUntilUs)) {
             onClipFailed(target.eventId)
         }
@@ -287,9 +304,11 @@ class ClipRecorder(
 
     /**
      * Ends [clip]. keep=false deletes the file instead of reporting it (Discard).
+     * [continued]: the caller will open a continuation part next (see
+     * [FinishedClip.continued]); only the natural end at the per-file cap passes true.
      * Returns the finished clip only when kept and finalised. Caller must hold [lock].
      */
-    private fun finish(clip: ActiveClip, keep: Boolean = true): FinishedClip? {
+    private fun finish(clip: ActiveClip, keep: Boolean = true, continued: Boolean = false): FinishedClip? {
         active = null
         val durationUs = clip.lastPtsUs - clip.window.startUs
         val ok = try {
@@ -309,7 +328,7 @@ class ClipRecorder(
             return null
         }
         Log.i(TAG, "Clip ${clip.target.eventId} finished, ${durationUs / 1000} ms")
-        val finished = FinishedClip(clip.target.eventId, clip.target.file, durationUs, clip.clipStartMs)
+        val finished = FinishedClip(clip.target.eventId, clip.target.file, durationUs, clip.clipStartMs, continued)
         onClipFinished(finished)
         return finished
     }

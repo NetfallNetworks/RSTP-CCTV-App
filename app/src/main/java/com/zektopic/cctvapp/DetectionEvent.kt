@@ -33,7 +33,15 @@ data class DetectionEvent(
     /** JSON array of detections during the clip: {t, label, score, box}. See ClipTimeline. */
     val detectionsJson: String? = null,
     /** JSON object {start_ms, step_ms, permille[]}: motion per detection pass. */
-    val activityJson: String? = null
+    val activityJson: String? = null,
+    /**
+     * The id of the first part of the recording this clip belongs to, set on every part
+     * including the first. A recording longer than the per-file cap is saved as consecutive
+     * parts, each its own event; this is what ties them together, so Discard removes them
+     * all and the archive takes them only once the recording has ended. Null on
+     * snapshot-only events.
+     */
+    val visitId: String? = null
 ) {
     companion object {
         /** Most specific first; an event's [type] is the highest of its tags. */
@@ -59,7 +67,8 @@ data class DetectionEvent(
                 clipBytes = if (obj.has("clip_bytes")) obj.optLong("clip_bytes") else null,
                 clipStartMs = if (obj.has("clip_start_ms")) obj.optLong("clip_start_ms") else null,
                 detectionsJson = obj.optJSONArray("detections")?.toString(),
-                activityJson = obj.optJSONObject("activity")?.toString()
+                activityJson = obj.optJSONObject("activity")?.toString(),
+                visitId = if (obj.has("visit_id")) obj.optString("visit_id") else null
             )
         }
     }
@@ -92,6 +101,7 @@ data class DetectionEvent(
         if (clipStartMs != null) obj.put("clip_start_ms", clipStartMs)
         if (detectionsJson != null) obj.put("detections", org.json.JSONArray(detectionsJson))
         if (activityJson != null) obj.put("activity", JSONObject(activityJson))
+        if (visitId != null) obj.put("visit_id", visitId)
         obj.put("created_at", createdAtMs)
         return obj
     }

@@ -136,6 +136,16 @@ class DetectionEventTest {
     }
 
     @Test
+    fun `visit id round trips and is omitted when absent`() {
+        val part = event().copy(visitId = "first-part-id")
+        val json = part.toJsonObject()
+        assertEquals("first-part-id", json.getString("visit_id"))
+        assertEquals(part, DetectionEvent.fromJsonObject(json))
+        assertFalse(event().toJsonObject().has("visit_id"))
+        assertNull(DetectionEvent.fromJsonObject(event().toJsonObject()).visitId)
+    }
+
+    @Test
     fun `manual ranks above motion but below animal`() {
         assertEquals("manual", event().copy(type = "motion", tags = listOf("motion")).withTag("manual").type)
         assertEquals("animal", event().copy(type = "manual", tags = listOf("manual")).withTag("animal").type)
