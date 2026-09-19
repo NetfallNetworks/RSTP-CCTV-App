@@ -27,9 +27,9 @@ recyclerview = "1.3.2"
 # rootEncoder must equal the SHA rtspServer pins, or Gradle picks between the two
 # arbitrarily. 165122d is RootEncoder's fix/rtsp-stapa-start-codes head (on top of the
 # already-merged eb97684 decouple-camera-capture-size fix on netfall/2.7.2); it is what
-# RTSP-Server's fix/pin-rootencoder-stapa (5ee2557) pins.
+# RTSP-Server's fix/pin-rootencoder-stapa (00f8046) pins.
 rootEncoder = "165122d05c219ceddec466869ab73a2b0038eeff"
-rtspServer = "5ee2557a9430f51c2d8ef3189869e864234c3281"
+rtspServer = "00f8046f9af9bca2fbbb158cb87cfb48125afeca"
 nanohttpd = "2.3.1"
 # tensorflow-lite-task-vision was frozen at 0.4.4 (Jul 2023) and its
 # libtask_vision_jni.so has 4 KB LOAD alignment, which fails Android 16 KB
