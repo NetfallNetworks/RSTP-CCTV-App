@@ -70,6 +70,7 @@ class WebServer(
     private val getBatteryLevel: () -> Int,
     private val getWifiStrength: () -> Int,
     private val getWebAuthEnabled: () -> Boolean,
+    private val recordApi: RecordApi,
     /**
      * Port to bind. Defaults to [PORT]; tests pass [EPHEMERAL_PORT] so they get a free
      * port from the OS instead of colliding with a [CctvServerService] already on 8080.
@@ -129,6 +130,35 @@ class WebServer(
 
     private fun processRequest(session: IHTTPSession): Response {
         val uri = session.uri
+
+        if (uri == "/record") return json(Response.Status.OK, recordApi.state())
+
+        if (uri.startsWith("/record/")) {
+            if (session.method != Method.POST) return json(Response.Status.METHOD_NOT_ALLOWED, """{"error":"POST"}""")
+            val minutes = session.parameters["minutes"]?.firstOrNull()?.toIntOrNull() ?: 15
+            val pauseAuto = session.parameters["pauseAuto"]?.firstOrNull()?.toIntOrNull() ?: 0
+            val body = when (uri) {
+                "/record/start" -> recordApi.start(minutes)
+                "/record/hold" -> recordApi.hold(minutes)
+                "/record/stop" -> recordApi.stop(pauseAuto)
+                "/record/discard" -> recordApi.discard(pauseAuto)
+                "/record/resume" -> recordApi.resume()
+                else -> return json(Response.Status.NOT_FOUND, """{"error":"unknown"}""")
+            }
+            return json(Response.Status.OK, body)
+        }
+
+        if (uri.startsWith("/events/") && uri.endsWith("/archived")) {
+            if (session.method != Method.POST) return json(Response.Status.METHOD_NOT_ALLOWED, """{"error":"POST"}""")
+            val id = uri.removePrefix("/events/").removeSuffix("/archived").trim('/')
+            val (code, body) = recordApi.archived(id)
+            val status = when (code) {
+                200 -> Response.Status.OK
+                404 -> Response.Status.NOT_FOUND
+                else -> Response.Status.CONFLICT
+            }
+            return json(status, body)
+        }
 
         if (uri == "/shot.jpg") {
             val imageBytes = imageProvider()
@@ -342,6 +372,9 @@ class WebServer(
             addHeader("Content-Range", "bytes $start-$end/$length")
         }
     }
+
+    private fun json(status: Response.Status, body: String): Response =
+        newFixedLengthResponse(status, "application/json", body)
 
     private fun escapeJson(s: String): String = s.replace("\\", "\\\\").replace("\"", "\\\"")
 
@@ -749,7 +782,7 @@ class WebServer(
                 </div>
             </div>
         </div>
-        
+        ${RecordWidget.html("")}
         <!-- Preview -->
         <div class="preview-card">
             <div class="preview-wrapper">
