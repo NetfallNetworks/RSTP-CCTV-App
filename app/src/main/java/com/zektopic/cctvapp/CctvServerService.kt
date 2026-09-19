@@ -228,16 +228,25 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
     /**
      * Event clips, cut from the stream encoder's own output. A finished clip arrives on the
      * encoder thread, so its bookkeeping is handed off rather than done there.
+     *
+     * A recording longer than the per-file cap is saved as consecutive parts sharing a
+     * visitId. Every part but the last is attached held (still `recording`, so the archive
+     * skips it); whatever ends the recording -- its last part finishing, or a part failing
+     * -- releases the whole visit at once, and Discard deletes the whole visit. All of it
+     * runs in order on [detectionExecutor], so a part's attach always precedes the release.
      */
     private val clipRecorder = ClipRecorder(
         onClipFinished = { clip ->
             val timeline = clipTimelines.remove(clip.eventId)
             clipTagsCache.remove(clip.eventId)
             val attach = Runnable {
+                val visitId = eventStore.getEvent(clip.eventId)?.visitId ?: clip.eventId
                 eventStore.attachClip(
                     clip.eventId, clip.file, System.currentTimeMillis(), clip.durationUs / 1000,
-                    clip.clipStartMs, timeline?.detectionsJson(), timeline?.activityJson()
+                    clip.clipStartMs, timeline?.detectionsJson(), timeline?.activityJson(),
+                    held = clip.continued
                 )
+                if (!clip.continued) eventStore.releaseVisit(visitId)
             }
             try {
                 detectionExecutor.execute(attach)
@@ -247,12 +256,14 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             }
         },
         // A clip that hit the length cap mid-activity continues as a new event with the
-        // same tags, so a long visit is still found under what was seen in it.
+        // same tags, so a long visit is still found under what was seen in it -- and the
+        // same visitId, so Discard and the archive treat all its parts as one recording.
         onRollover = { previous ->
             val prior = eventStore.getEvent(previous.eventId)
             val type = prior?.type ?: "motion"
             val event = eventStore.createDetectionEvent(
-                type, prior?.score, currentSnapshot.get(), prior?.tags?.ifEmpty { null } ?: listOf(type), recording = true
+                type, prior?.score, currentSnapshot.get(), prior?.tags?.ifEmpty { null } ?: listOf(type), recording = true,
+                visitId = prior?.visitId ?: previous.eventId
             )
             seedTagsCache(event)
             ClipRecorder.ClipTarget(event.id, eventStore.clipFileFor(event.id))
@@ -260,10 +271,16 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
         // A clip that never started or never finalised otherwise leaves its event stuck
         // reporting recording=true -- and /events/<id>/archived stuck at 409 -- until the
         // next process restart runs recoverInterrupted(). Clear it immediately instead.
+        // A failure also ends the recording, so release any earlier parts held for it.
+        // (clearRecording leaves a held part alone: onRollover declining reports one here.)
         onClipFailed = { id ->
             clipTimelines.remove(id)
             clipTagsCache.remove(id)
-            val clear = Runnable { eventStore.clearRecording(id) }
+            val clear = Runnable {
+                val visitId = eventStore.getEvent(id)?.visitId ?: id
+                eventStore.clearRecording(id)
+                eventStore.releaseVisit(visitId)
+            }
             try {
                 detectionExecutor.execute(clear)
             } catch (_: java.util.concurrent.RejectedExecutionException) {
@@ -351,7 +368,12 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             clipRecorder.discard()?.let { id ->
                 clipTimelines.remove(id)
                 clipTagsCache.remove(id)
-                eventStore.discardEvent(id)
+                // Discard means the whole recording: every rollover part, not just this one.
+                // Earlier parts are still held (recording=true), so the archive can't have
+                // taken them. A queued attach for the part just before this one finds its
+                // event gone and deletes the file.
+                val visitId = eventStore.getEvent(id)?.visitId ?: id
+                if (eventStore.discardVisit(visitId) == 0) eventStore.discardEvent(id)
             }
             return state()
         }
