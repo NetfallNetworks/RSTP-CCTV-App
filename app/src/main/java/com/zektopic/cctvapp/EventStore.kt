@@ -6,6 +6,8 @@ import org.json.JSONObject
 import java.io.File
 import java.util.UUID
 
+enum class ArchiveResult { DELETED, NOT_FOUND, RECORDING }
+
 /**
  * On-disk store for detection events and their snapshots.
  *
@@ -111,7 +113,9 @@ class EventStore(
         type: String,
         score: Double?,
         snapshotJpeg: ByteArray?,
-        tags: List<String> = listOf(type)
+        tags: List<String> = listOf(type),
+        recording: Boolean = false,
+        visitId: String? = null
     ): DetectionEvent {
         val now = System.currentTimeMillis()
         val id = UUID.randomUUID().toString()
@@ -132,7 +136,11 @@ class EventStore(
             snapshotFileName = snapshotFileName,
             clipFileName = null,
             createdAtMs = now,
-            tags = tags
+            tags = tags,
+            recording = recording,
+            // A clip event always belongs to a visit: the one it continues, or -- for a
+            // first part -- its own, which only exists once the id above does.
+            visitId = visitId ?: if (recording) id else null
         )
         addEvent(event)
         return event
@@ -189,8 +197,18 @@ class EventStore(
      * Records that event [id]'s clip is complete, then evicts the oldest events until
      * media fits under [maxMediaBytes]. Returns false, and deletes the clip, if the event
      * was evicted while its clip was still recording.
+     *
+     * [held]: this is a finished part of a recording that continues in another file. Its
+     * clip is attached but it stays `recording`, so the archive skips it (and
+     * archiveEvent refuses it) until [releaseVisit] ends the whole recording at once --
+     * otherwise the puller could copy and delete an early part of a recording that is
+     * later discarded.
      */
-    fun attachClip(id: String, clipFile: File, endTimeMs: Long, durationMs: Long? = null): Boolean {
+    fun attachClip(
+        id: String, clipFile: File, endTimeMs: Long, durationMs: Long?,
+        clipStartMs: Long?, detectionsJson: String?, activityJson: String?,
+        held: Boolean = false
+    ): Boolean {
         synchronized(lock) {
             val events = readEventsInternal()
             val index = events.indexOfFirst { it.id == id }
@@ -199,10 +217,126 @@ class EventStore(
                 return false
             }
             events[index] = events[index].copy(
-                clipFileName = clipFile.name, endTimeMs = endTimeMs, clipDurationMs = durationMs
+                clipFileName = clipFile.name, endTimeMs = endTimeMs, clipDurationMs = durationMs,
+                recording = held, clipBytes = clipFile.length(), clipStartMs = clipStartMs,
+                detectionsJson = detectionsJson, activityJson = activityJson
             )
             writeEventsInternal(enforceMaxMediaBytes(events))
             return true
+        }
+    }
+
+    /** Removes event [id] and its media: a discarded recording. */
+    fun discardEvent(id: String): Boolean = removeEvent(id) != null
+
+    /**
+     * The recording [visitId] has ended: every part of it with a clip attached (the held
+     * ones) stops reporting `recording`, so the archive can take them together. A part
+     * still being written has no clip yet and is left alone. Returns parts released.
+     */
+    fun releaseVisit(visitId: String): Int {
+        synchronized(lock) {
+            val events = readEventsInternal()
+            var released = 0
+            for (i in events.indices) {
+                val e = events[i]
+                if (e.visitId != visitId || !e.recording || e.clipFileName == null) continue
+                events[i] = e.copy(recording = false)
+                released++
+            }
+            if (released > 0) writeEventsInternal(events)
+            return released
+        }
+    }
+
+    /**
+     * Discard of a recording: removes every part of [visitId] and its media, including a
+     * part still being written. Returns events removed. Parts already released under media
+     * pressure (see [enforceMaxMediaBytes]) are deleted only if still on the device -- the
+     * archive may already have taken them.
+     */
+    fun discardVisit(visitId: String): Int {
+        synchronized(lock) {
+            val events = readEventsInternal()
+            val (drop, keep) = events.partition { it.visitId == visitId }
+            if (drop.isEmpty()) return 0
+            for (event in drop) {
+                deleteMediaFor(event)
+                clipFileFor(event.id).delete()
+            }
+            writeEventsInternal(keep)
+            return drop.size
+        }
+    }
+
+    /** The archive has a verified copy of [id]; drop the local one unless it is still recording. */
+    fun archiveEvent(id: String): ArchiveResult {
+        synchronized(lock) {
+            val event = readEventsInternal().firstOrNull { it.id == id } ?: return ArchiveResult.NOT_FOUND
+            if (event.recording) return ArchiveResult.RECORDING
+            removeEvent(id)
+            return ArchiveResult.DELETED
+        }
+    }
+
+    /**
+     * A process killed mid-clip leaves its event marked recording and an MP4 with no
+     * index (MediaMuxer writes it on stop), which nothing can play. Clear the flag and
+     * drop the file so the event archives as snapshot-only. Returns events recovered.
+     *
+     * An event still `recording` with its clip attached is different: a held, finalised
+     * part of a recording that never got to end (see attachClip's `held`). Its clip is
+     * complete, so it is released and kept -- the recording cannot continue after a
+     * restart anyway.
+     */
+    fun recoverInterrupted(): Int {
+        synchronized(lock) {
+            val events = readEventsInternal()
+            var recovered = 0
+            for (i in events.indices) {
+                if (!events[i].recording) continue
+                if (events[i].clipFileName != null) {
+                    events[i] = events[i].copy(recording = false)
+                } else {
+                    clipFileFor(events[i].id).delete()
+                    events[i] = events[i].copy(recording = false, clipFileName = null)
+                }
+                recovered++
+            }
+            if (recovered > 0) writeEventsInternal(events)
+            return recovered
+        }
+    }
+
+    /**
+     * Clears event [id]'s recording flag and drops its partial clip, the same recovery
+     * [recoverInterrupted] does at startup -- but immediately, for a clip that failed to
+     * start or finish mid-session, so the event does not stay stuck reporting RECORDING to
+     * /events/<id>/archived until the next restart. Returns false, and changes nothing, if
+     * the event does not exist, was not marked recording, or already has its clip attached
+     * (a held part: its clip is complete, and [releaseVisit] is what ends it).
+     */
+    fun clearRecording(id: String): Boolean {
+        synchronized(lock) {
+            val events = readEventsInternal()
+            val index = events.indexOfFirst { it.id == id }
+            if (index < 0 || !events[index].recording || events[index].clipFileName != null) return false
+            clipFileFor(id).delete()
+            events[index] = events[index].copy(recording = false, clipFileName = null)
+            writeEventsInternal(events)
+            return true
+        }
+    }
+
+    private fun removeEvent(id: String): DetectionEvent? {
+        synchronized(lock) {
+            val events = readEventsInternal()
+            val event = events.firstOrNull { it.id == id } ?: return null
+            deleteMediaFor(event)
+            clipFileFor(id).delete()
+            events.remove(event)
+            writeEventsInternal(events)
+            return event
         }
     }
 
@@ -254,15 +388,41 @@ class EventStore(
     /**
      * Drops the oldest events, and their media, until what remains fits in
      * [maxMediaBytes]. The newest event is always kept. Caller must hold [lock].
+     *
+     * Release under pressure: when media is over the cap, every held part (see
+     * attachClip's `held`: still `recording`, clip attached) is first released --
+     * `recording = false`, clip kept -- and is exempt from eviction in this same pass, so
+     * the archive gets a chance to copy it. All held parts go at once rather than just
+     * enough to fit, so a recording's parts still become archivable together. Released
+     * parts still count toward the total, so older events are evicted to make room; on a
+     * later over-cap pass they are ordinary finished events and are evicted like any other.
+     * Without this, one long recording (roughly 4 h at frankie's ~1-1.35 Mbit/s, sooner
+     * with un-archived clips present) would delete its own early parts unseen.
+     *
+     * The cost: Discard of a recording that long can no longer delete the parts already
+     * released here -- once released they may already be archived, and discardVisit only
+     * deletes what is still on the device.
      */
     private fun enforceMaxMediaBytes(events: MutableList<DetectionEvent>): List<DetectionEvent> {
+        val released = mutableSetOf<String>()
+        if (events.sumOf { mediaBytesOf(it) } > maxMediaBytes) {
+            for (i in events.indices) {
+                val e = events[i]
+                if (!e.recording || e.clipFileName == null) continue
+                events[i] = e.copy(recording = false)
+                released += e.id
+            }
+        }
         val newestFirst = events.sortedByDescending { it.startTimeMs }
         var total = 0L
         var full = false
         val keep = mutableListOf<DetectionEvent>()
         for (event in newestFirst) {
             val size = mediaBytesOf(event)
-            if (full || (keep.isNotEmpty() && total + size > maxMediaBytes)) {
+            if (event.id in released) {
+                total += size
+                keep.add(event)
+            } else if (full || (keep.isNotEmpty() && total + size > maxMediaBytes)) {
                 // Everything older goes too, so eviction stays strictly oldest-first.
                 full = true
                 deleteMediaFor(event)

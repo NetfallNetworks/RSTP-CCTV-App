@@ -111,4 +111,43 @@ class DetectionEventTest {
         // EventStore relies on this to skip corrupt rows rather than serving a bad id.
         DetectionEvent.fromJsonObject(JSONObject().put("type", "motion"))
     }
+
+    @Test
+    fun `archive fields round trip`() {
+        // org.json.JSONObject backs onto a plain HashMap (verified against the
+        // 20250517 jar), so it does not preserve key insertion order. Seed `original`
+        // with text already run through the same parser toJsonObject() uses, so the
+        // round trip compares like for like instead of tripping over incidental key
+        // order the data itself doesn't care about.
+        val original = event().copy(
+            recording = true, clipBytes = 1234L, clipStartMs = 999L,
+            detectionsJson = org.json.JSONArray(
+                """[{"t":1000,"label":"animal","score":0.5,"box":[0.1,0.2,0.3,0.4]}]"""
+            ).toString(),
+            activityJson = JSONObject(
+                """{"start_ms":1000,"step_ms":1000,"permille":[0,5,12]}"""
+            ).toString()
+        )
+        val json = original.toJsonObject()
+        assertTrue(json.getBoolean("recording"))
+        assertEquals("animal", json.getJSONArray("detections").getJSONObject(0).getString("label"))
+        assertEquals(12, json.getJSONObject("activity").getJSONArray("permille").getInt(2))
+        assertEquals(original, DetectionEvent.fromJsonObject(json))
+    }
+
+    @Test
+    fun `visit id round trips and is omitted when absent`() {
+        val part = event().copy(visitId = "first-part-id")
+        val json = part.toJsonObject()
+        assertEquals("first-part-id", json.getString("visit_id"))
+        assertEquals(part, DetectionEvent.fromJsonObject(json))
+        assertFalse(event().toJsonObject().has("visit_id"))
+        assertNull(DetectionEvent.fromJsonObject(event().toJsonObject()).visitId)
+    }
+
+    @Test
+    fun `manual ranks above motion but below animal`() {
+        assertEquals("manual", event().copy(type = "motion", tags = listOf("motion")).withTag("manual").type)
+        assertEquals("animal", event().copy(type = "manual", tags = listOf("manual")).withTag("animal").type)
+    }
 }
