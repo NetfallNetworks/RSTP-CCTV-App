@@ -244,7 +244,12 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             ClipRecorder.ClipTarget(event.id, eventStore.clipFileFor(event.id))
         }
     )
-    /** (eventId, tag) pairs already written; detection thread only. */
+    /**
+     * (eventId, tag) pairs already written. Touched from the detection thread (recordClip)
+     * and from NanoHTTPD worker threads (RecordApi.start/hold), so every access goes
+     * through [markTagApplied] rather than calling add() directly -- a plain LinkedHashSet
+     * is not thread-safe, and add() here also mutates on the size-cap eviction.
+     */
     private val clipTagsApplied = object : LinkedHashSet<Pair<String, String>>() {
         override fun add(element: Pair<String, String>): Boolean {
             val added = super.add(element)
@@ -252,6 +257,10 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             return added
         }
     }
+
+    /** Thread-safe add to [clipTagsApplied]; see its KDoc. */
+    private fun markTagApplied(id: String, tag: String): Boolean =
+        synchronized(clipTagsApplied) { clipTagsApplied.add(id to tag) }
     private val motionDetector = MotionDetector()
     private lateinit var liteRtObjectDetector: LiteRtObjectDetector
     private var eventCaptioner: EventCaptioner? = null
@@ -282,13 +291,13 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                 val event = eventStore.createDetectionEvent("manual", null, currentSnapshot.get(), recording = true)
                 ClipRecorder.ClipTarget(event.id, eventStore.clipFileFor(event.id))
             }
-            result.eventId?.let { if (clipTagsApplied.add(it to "manual")) eventStore.tagEvent(it, "manual") }
+            result.eventId?.let { if (markTagApplied(it, "manual")) eventStore.tagEvent(it, "manual") }
             return state()
         }
 
         override fun hold(minutes: Int): String {
             if (clipRecorder.hold(minutes.coerceIn(1, 30))) {
-                clipRecorder.activeEventId?.let { if (clipTagsApplied.add(it to "manual")) eventStore.tagEvent(it, "manual") }
+                clipRecorder.activeEventId?.let { if (markTagApplied(it, "manual")) eventStore.tagEvent(it, "manual") }
             }
             return state()
         }
@@ -1013,7 +1022,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             clipTimelines.getOrPut(id) { ClipTimeline() }.addDetection(capturedAtMs, type, score, box)
         }
         when (result.outcome) {
-            ClipRecorder.Outcome.EXTENDED -> id?.let { if (clipTagsApplied.add(it to type)) eventStore.tagEvent(it, type) }
+            ClipRecorder.Outcome.EXTENDED -> id?.let { if (markTagApplied(it, type)) eventStore.tagEvent(it, type) }
             ClipRecorder.Outcome.STARTED -> Unit
             ClipRecorder.Outcome.UNAVAILABLE -> maybeCreateDetectionEvent(type, score, snapshotJpeg)
         }
