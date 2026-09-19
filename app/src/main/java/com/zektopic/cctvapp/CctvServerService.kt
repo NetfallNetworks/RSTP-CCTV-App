@@ -59,6 +59,31 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
 
         /** COCO labels treated as an "animal" event. */
         private val ANIMAL_LABELS = setOf("cat", "dog", "bird", "horse", "sheep", "cow")
+
+        /**
+         * GL rotation of the camera texture, passed to our RootEncoder fork's
+         * prepareVideoCropped(). The stream should show the same picture the camera app
+         * takes -- same orientation, same proportions, same landscape 4:3 shape.
+         *
+         * Plain prepareVideo() can't do that here: for this camera it needs rotation=90
+         * to come out upright, and RootEncoder then declares the encoder transposed
+         * (768x1024) while drawing the still-landscape picture into it -- a 4:3 image
+         * squeezed to 75% width and stretched to 133% height. Measured on 2026-09-18
+         * against a native photo of the same scene, camera untouched in between: light-
+         * grid spacing scaled x0.675 horizontally vs x1.24 vertically, ~(3/4)^2, and the
+         * frame un-squashed to 4:3 matched the photo's proportions.
+         */
+        private const val GL_CONTENT_ROTATION_DEGREES = 0
+
+        /**
+         * This camera's raw frames are mirrored left-right relative to the photo the native
+         * camera app takes of the same scene (a door on the left in the photo sat on the
+         * right in the stream). RootEncoder's Camera2 path applies no front-camera mirroring
+         * of its own, so the reflection is in what this hardware delivers and the stock app
+         * is correcting it; the stream has to correct it too. Applied in the encoder draw,
+         * i.e. in the output frame's own axes, after [GL_CONTENT_ROTATION_DEGREES].
+         */
+        private const val MIRROR_STREAM_HORIZONTALLY = true
     }
 
     private lateinit var rtspServerCamera: RtspServerCamera2
@@ -1082,11 +1107,16 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
 
                 // Audio is opt-in. Recording it forces the microphone foreground-service
                 // type and the RECORD_AUDIO grant; a camera-only stream needs neither.
-                if (audioEnabled && hasPermission(android.Manifest.permission.RECORD_AUDIO)) {
+                // disableAudio() alone still leaves an AAC track in the SDP that never gets
+                // a packet, and players that wait for every announced track (ffmpeg does)
+                // stall on it -- setOnlyVideo() drops the track from what's announced.
+                val streamAudio = audioEnabled && hasPermission(android.Manifest.permission.RECORD_AUDIO)
+                if (streamAudio) {
                     rtspServerCamera.prepareAudio(64 * 1024, 44100, true, false, false)
                 } else {
                     rtspServerCamera.disableAudio()
                 }
+                rtspServerCamera.getStreamClient().setOnlyVideo(!streamAudio)
 
                 // Check and set Codec
                 val selectedCodec = when (videoCodec) {
@@ -1136,12 +1166,16 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                     android.util.Log.d("CctvServerService", "RTSP auth disabled")
                 }
 
-                // The five-argument overload is (w, h, fps, bitrate, rotation) and
-                // hard-codes a 2 second keyframe interval internally. The six-argument
-                // one takes the interval explicitly -- that extra argument is the whole
-                // reason for switching overloads, so keep the rotation argument last.
-                if (rtspServerCamera.prepareVideo(
-                        videoWidth, videoHeight, videoFps, bitrate, keyframeIntervalSeconds, 0
+                rtspServerCamera.getGlInterface().setIsStreamHorizontalFlip(MIRROR_STREAM_HORIZONTALLY)
+
+                // Camera capture, content and encoder output are all videoWidth x
+                // videoHeight -- the camera's own 4:3 landscape mode -- so nothing is
+                // cropped, padded or rescaled on one axis only. See
+                // GL_CONTENT_ROTATION_DEGREES for why this isn't plain prepareVideo().
+                if (rtspServerCamera.prepareVideoCropped(
+                        videoWidth, videoHeight, videoWidth, videoHeight,
+                        videoFps, bitrate, keyframeIntervalSeconds,
+                        GL_CONTENT_ROTATION_DEGREES, false
                     )
                 ) {
                     rtspServerCamera.startStream()
@@ -1165,9 +1199,10 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                         codec = "H264",
                         manualKbps = bitrateKbps.takeIf { it != AppPreferences.BITRATE_AUTO }
                     )
-                    if (rtspServerCamera.prepareVideo(
-                            videoWidth, videoHeight, videoFps,
-                            EncoderProfile.kbpsToBps(fallbackKbps), keyframeIntervalSeconds, 0
+                    if (rtspServerCamera.prepareVideoCropped(
+                            videoWidth, videoHeight, videoWidth, videoHeight,
+                            videoFps, EncoderProfile.kbpsToBps(fallbackKbps), keyframeIntervalSeconds,
+                            GL_CONTENT_ROTATION_DEGREES, false
                         )
                     ) {
                          rtspServerCamera.startStream()
