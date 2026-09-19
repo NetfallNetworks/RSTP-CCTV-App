@@ -23,11 +23,21 @@ data class DetectionEvent(
      */
     val tags: List<String> = emptyList(),
     /** Length of the recorded clip. Not end minus start: a clip includes its pre-roll. */
-    val clipDurationMs: Long? = null
+    val clipDurationMs: Long? = null,
+    /** True while this event's clip is still being written; the archive skips these. */
+    val recording: Boolean = false,
+    /** Final clip size, so a copy can be verified. */
+    val clipBytes: Long? = null,
+    /** Wall-clock time of the clip's first frame (it opens with pre-roll, before [startTimeMs]). */
+    val clipStartMs: Long? = null,
+    /** JSON array of detections during the clip: {t, label, score, box}. See ClipTimeline. */
+    val detectionsJson: String? = null,
+    /** JSON object {start_ms, step_ms, permille[]}: motion per detection pass. */
+    val activityJson: String? = null
 ) {
     companion object {
         /** Most specific first; an event's [type] is the highest of its tags. */
-        val TYPE_PRIORITY = listOf("person", "animal", "motion", "test")
+        val TYPE_PRIORITY = listOf("person", "animal", "manual", "motion", "test")
 
         fun fromJsonObject(obj: JSONObject): DetectionEvent {
             val tagsArray = obj.optJSONArray("tags")
@@ -44,7 +54,12 @@ data class DetectionEvent(
                 createdAtMs = obj.optLong("created_at", System.currentTimeMillis()),
                 caption = if (obj.has("caption")) obj.optString("caption") else null,
                 tags = tags,
-                clipDurationMs = if (obj.has("clip_duration_ms")) obj.optLong("clip_duration_ms") else null
+                clipDurationMs = if (obj.has("clip_duration_ms")) obj.optLong("clip_duration_ms") else null,
+                recording = obj.optBoolean("recording", false),
+                clipBytes = if (obj.has("clip_bytes")) obj.optLong("clip_bytes") else null,
+                clipStartMs = if (obj.has("clip_start_ms")) obj.optLong("clip_start_ms") else null,
+                detectionsJson = obj.optJSONArray("detections")?.toString(),
+                activityJson = obj.optJSONObject("activity")?.toString()
             )
         }
     }
@@ -72,6 +87,11 @@ data class DetectionEvent(
         if (caption != null) obj.put("caption", caption)
         obj.put("tags", org.json.JSONArray(tags))
         if (clipDurationMs != null) obj.put("clip_duration_ms", clipDurationMs)
+        obj.put("recording", recording)
+        if (clipBytes != null) obj.put("clip_bytes", clipBytes)
+        if (clipStartMs != null) obj.put("clip_start_ms", clipStartMs)
+        if (detectionsJson != null) obj.put("detections", org.json.JSONArray(detectionsJson))
+        if (activityJson != null) obj.put("activity", JSONObject(activityJson))
         obj.put("created_at", createdAtMs)
         return obj
     }

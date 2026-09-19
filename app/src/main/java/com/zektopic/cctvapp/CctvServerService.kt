@@ -216,7 +216,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
     private val clipRecorder = ClipRecorder(
         onClipFinished = { clip ->
             val attach = Runnable {
-                eventStore.attachClip(clip.eventId, clip.file, System.currentTimeMillis(), clip.durationUs / 1000)
+                eventStore.attachClip(clip.eventId, clip.file, System.currentTimeMillis(), clip.durationUs / 1000, null, null, null)
             }
             try {
                 detectionExecutor.execute(attach)
