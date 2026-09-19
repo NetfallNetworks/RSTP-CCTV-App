@@ -86,6 +86,32 @@ class MotionDetectorTest {
     }
 
     @Test
+    fun `the most sensitive setting reaches a small animal's footprint`() {
+        // Well under 1% of the frame; the old linear scale bottomed out at exactly 1%.
+        assertEquals(0.003, MotionDetector.sensitivityToThresholdRatio(10), 1e-9)
+        assertTrue(MotionDetector.sensitivityToThresholdRatio(AppPreferences.DEFAULT_MOTION_SENSITIVITY) < 0.01)
+    }
+
+    @Test
+    fun `slow movement is caught against the older frame`() {
+        // A block that creeps one sample per frame: each step changes a sliver, the
+        // whole creep changes much more.
+        fun frameWithBlockAt(x: Int) = IntArray(100) { i -> if (i % 10 in x until x + 3) 200 else 50 }
+        val history = listOf(frameWithBlockAt(0), frameWithBlockAt(1), frameWithBlockAt(2), frameWithBlockAt(3))
+        val current = frameWithBlockAt(4)
+
+        val consecutive = MotionDetector.changedRatio(history.last(), current, 20)
+        val withHistory = MotionDetector.changedRatioAgainstHistory(history, current, 20)
+        assertEquals(0.2, consecutive, 1e-9)
+        assertEquals(0.6, withHistory, 1e-9)
+    }
+
+    @Test
+    fun `no history means no motion yet`() {
+        assertEquals(0.0, MotionDetector.changedRatioAgainstHistory(emptyList(), IntArray(10), 20), 1e-9)
+    }
+
+    @Test
     fun `sensitivity input is clamped to the supported range`() {
         assertEquals(
             MotionDetector.sensitivityToThresholdRatio(1),

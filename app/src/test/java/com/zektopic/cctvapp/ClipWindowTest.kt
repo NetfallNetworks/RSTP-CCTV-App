@@ -39,4 +39,13 @@ class ClipWindowTest {
         w.extend(200 * second)
         assertEquals(60 * second, w.endAtUs)
     }
+
+    @Test
+    fun `knows when the cap cut it short`() {
+        val w = window()
+        assertFalse(w.cutShort)
+        w.extend(200 * second)
+        assertTrue(w.cutShort)
+        assertEquals(210 * second, w.requestedEndUs)
+    }
 }

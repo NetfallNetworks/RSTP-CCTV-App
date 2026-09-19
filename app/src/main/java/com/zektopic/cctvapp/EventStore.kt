@@ -33,7 +33,7 @@ class EventStore(
          * make this necessary: at stream bitrates a busy evening is hundreds of MB, and
          * the Echo Show 5 this runs on has under 3 GB free in total.
          */
-        const val DEFAULT_MAX_MEDIA_BYTES: Long = 1_500L * 1024L * 1024L
+        const val DEFAULT_MAX_MEDIA_BYTES: Long = 2_000L * 1024L * 1024L
 
         fun forContext(context: Context): EventStore = EventStore(context.filesDir)
     }
@@ -107,7 +107,12 @@ class EventStore(
         return event
     }
 
-    fun createDetectionEvent(type: String, score: Double?, snapshotJpeg: ByteArray?): DetectionEvent {
+    fun createDetectionEvent(
+        type: String,
+        score: Double?,
+        snapshotJpeg: ByteArray?,
+        tags: List<String> = listOf(type)
+    ): DetectionEvent {
         val now = System.currentTimeMillis()
         val id = UUID.randomUUID().toString()
         val snapshotFileName = if (snapshotJpeg != null && snapshotJpeg.isNotEmpty()) {
@@ -126,10 +131,30 @@ class EventStore(
             endTimeMs = now,
             snapshotFileName = snapshotFileName,
             clipFileName = null,
-            createdAtMs = now
+            createdAtMs = now,
+            tags = tags
         )
         addEvent(event)
         return event
+    }
+
+    /**
+     * Adds [tag] to event [id], raising its type if the tag is more specific -- a clip
+     * that began as motion becomes an "animal" event once an animal is seen in it.
+     * Returns false if the event has been evicted.
+     */
+    fun tagEvent(id: String, tag: String): Boolean {
+        synchronized(lock) {
+            val events = readEventsInternal()
+            val index = events.indexOfFirst { it.id == id }
+            if (index < 0) return false
+            val tagged = events[index].withTag(tag)
+            if (tagged != events[index]) {
+                events[index] = tagged
+                writeEventsInternal(events)
+            }
+            return true
+        }
     }
 
     fun cleanupExpired(nowMs: Long = System.currentTimeMillis()): Int {
@@ -165,7 +190,7 @@ class EventStore(
      * media fits under [maxMediaBytes]. Returns false, and deletes the clip, if the event
      * was evicted while its clip was still recording.
      */
-    fun attachClip(id: String, clipFile: File, endTimeMs: Long): Boolean {
+    fun attachClip(id: String, clipFile: File, endTimeMs: Long, durationMs: Long? = null): Boolean {
         synchronized(lock) {
             val events = readEventsInternal()
             val index = events.indexOfFirst { it.id == id }
@@ -173,7 +198,9 @@ class EventStore(
                 clipFile.delete()
                 return false
             }
-            events[index] = events[index].copy(clipFileName = clipFile.name, endTimeMs = endTimeMs)
+            events[index] = events[index].copy(
+                clipFileName = clipFile.name, endTimeMs = endTimeMs, clipDurationMs = durationMs
+            )
             writeEventsInternal(enforceMaxMediaBytes(events))
             return true
         }
@@ -268,7 +295,7 @@ class EventStore(
         }
     }
 
-    private fun getEvent(id: String): DetectionEvent? {
+    fun getEvent(id: String): DetectionEvent? {
         synchronized(lock) {
             return readEventsInternal().firstOrNull { it.id == id }
         }

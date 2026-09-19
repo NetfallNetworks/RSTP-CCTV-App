@@ -251,7 +251,7 @@ class EventStoreTest {
         val event = eventStore.createDetectionEvent("person", 0.9, jpeg)
         val clip = eventStore.clipFileFor(event.id)
         clip.writeBytes(ByteArray(clipBytes))
-        assertTrue(eventStore.attachClip(event.id, clip, event.startTimeMs + 15_000))
+        assertTrue(eventStore.attachClip(event.id, clip, event.startTimeMs + 15_000, 20_000))
         // startTimeMs orders eviction; keep consecutive events distinct.
         Thread.sleep(3)
         return event.id
@@ -265,6 +265,7 @@ class EventStoreTest {
         val json = org.json.JSONObject(eventStore.getEventAsJson(id)!!)
         assertTrue(json.getBoolean("has_clip"))
         assertEquals(json.getLong("start_time") + 15_000, json.getLong("end_time"))
+        assertEquals(20_000L, json.getLong("clip_duration_ms"))
     }
 
     @Test
@@ -285,6 +286,22 @@ class EventStoreTest {
         val remaining = eventStore.listRecentEvents(10).map { it.id }
         assertEquals(listOf(newest, middle), remaining)
         assertFalse(eventStore.clipFileFor(oldest).exists())
+    }
+
+    @Test
+    fun `a motion clip becomes an animal event when one is seen`() {
+        val eventStore = store()
+        val event = eventStore.createDetectionEvent("motion", 0.01, jpeg)
+        assertTrue(eventStore.tagEvent(event.id, "animal"))
+
+        val reloaded = EventStore(tempFolder.root).listRecentEvents(10).single()
+        assertEquals("animal", reloaded.type)
+        assertEquals(listOf("motion", "animal"), reloaded.tags)
+    }
+
+    @Test
+    fun `tagging an evicted event is reported rather than throwing`() {
+        assertFalse(store().tagEvent("gone", "animal"))
     }
 
     @Test

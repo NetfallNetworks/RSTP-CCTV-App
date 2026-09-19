@@ -28,14 +28,27 @@ class ClipRecorder(
     preRollUs: Long = DEFAULT_PRE_ROLL_US,
     private val postRollUs: Long = DEFAULT_POST_ROLL_US,
     private val maxClipUs: Long = DEFAULT_MAX_CLIP_US,
-    private val onClipFinished: (FinishedClip) -> Unit
+    private val onClipFinished: (FinishedClip) -> Unit,
+    /**
+     * Where the next file goes when a clip hits [maxClipUs] while activity is still
+     * extending it. It starts from the pre-roll buffer, so it overlaps the end of the
+     * last one rather than leaving a gap. Returning null ends recording there.
+     */
+    private val onRollover: (FinishedClip) -> ClipTarget?
 ) : RecordController {
 
     companion object {
         private const val TAG = "ClipRecorder"
         const val DEFAULT_PRE_ROLL_US = 5_000_000L
-        const val DEFAULT_POST_ROLL_US = 10_000_000L
-        const val DEFAULT_MAX_CLIP_US = 120_000_000L
+
+        /**
+         * Long, because animals move slowly and in bursts -- a cat can sit still for half
+         * a minute between steps. Ending a clip in that pause cuts the part worth seeing.
+         */
+        const val DEFAULT_POST_ROLL_US = 60_000_000L
+
+        /** Per file, not per event: activity beyond it continues in a rollover clip. */
+        const val DEFAULT_MAX_CLIP_US = 600_000_000L
 
         /** Ceiling for the pre-roll; several times what 7 s at stream bitrates needs. */
         private const val MAX_BUFFER_BYTES = 16L * 1024 * 1024
@@ -45,7 +58,7 @@ class ClipRecorder(
     class ClipTarget(val eventId: String, val file: File)
     class FinishedClip(val eventId: String, val file: File, val durationUs: Long)
 
-    enum class Trigger {
+    enum class Outcome {
         /** A new clip opened; the caller's target is now being written. */
         STARTED,
         /** A clip was already open and now runs longer. */
@@ -53,6 +66,9 @@ class ClipRecorder(
         /** No clip: nothing encoded yet, or the muxer could not be opened. */
         UNAVAILABLE
     }
+
+    /** [eventId] is the event whose clip is recording, for STARTED and EXTENDED. */
+    class Trigger(val outcome: Outcome, val eventId: String? = null)
 
     private class ActiveClip(
         val target: ClipTarget,
@@ -75,34 +91,44 @@ class ClipRecorder(
      * about to start, and supplies where it goes; returning null declines.
      */
     fun trigger(open: () -> ClipTarget?): Trigger = synchronized(lock) {
-        val nowUs = buffer.newestPtsUs ?: return Trigger.UNAVAILABLE
+        val unavailable = Trigger(Outcome.UNAVAILABLE)
+        val nowUs = buffer.newestPtsUs ?: return unavailable
         active?.let {
             it.window.extend(nowUs)
-            return Trigger.EXTENDED
+            return Trigger(Outcome.EXTENDED, it.target.eventId)
         }
-        val format = videoFormat ?: return Trigger.UNAVAILABLE
+        if (videoFormat == null || buffer.framesFromKeyFrame().isEmpty()) return unavailable
+        val target = open() ?: return unavailable
+        return if (startClip(target, nowUs)) Trigger(Outcome.STARTED, target.eventId) else unavailable
+    }
+
+    /**
+     * Opens [target] and writes the pre-roll into it, ending [postRollUs] after
+     * [triggeredAtUs] unless extended. Caller must hold [lock].
+     */
+    private fun startClip(target: ClipTarget, triggeredAtUs: Long): Boolean {
+        val format = videoFormat ?: return false
         val frames = buffer.framesFromKeyFrame()
-        if (frames.isEmpty()) return Trigger.UNAVAILABLE
-        val target = open() ?: return Trigger.UNAVAILABLE
+        if (frames.isEmpty()) return false
 
         var muxer: MediaMuxer? = null
-        try {
+        return try {
             muxer = MediaMuxer(target.file.path, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
             val track = muxer.addTrack(format)
             muxer.start()
             val clip = ActiveClip(
                 target, muxer, track,
-                ClipWindow(postRollUs, maxClipUs, frames.first().ptsUs, nowUs)
+                ClipWindow(postRollUs, maxClipUs, frames.first().ptsUs, triggeredAtUs)
             )
             for (frame in frames) write(clip, frame)
             active = clip
             Log.i(TAG, "Clip ${target.eventId} started with ${frames.size} pre-roll frames")
-            Trigger.STARTED
+            true
         } catch (e: Exception) {
             Log.e(TAG, "Could not start clip ${target.eventId}", e)
             try { muxer?.release() } catch (_: Exception) {}
             target.file.delete()
-            Trigger.UNAVAILABLE
+            false
         }
     }
 
@@ -118,7 +144,8 @@ class ClipRecorder(
             buffer.add(frame)
             val clip = active ?: return
             if (clip.window.isOver(frame.ptsUs)) {
-                finish(clip)
+                val finished = finish(clip)
+                if (finished != null && clip.window.cutShort) rollOver(finished, clip.window)
                 return
             }
             try {
@@ -162,8 +189,22 @@ class ClipRecorder(
         clip.lastPtsUs = frame.ptsUs
     }
 
-    /** Caller must hold [lock]. */
-    private fun finish(clip: ActiveClip) {
+    /**
+     * Continues a clip that hit the length cap while still wanted, in a new file that
+     * runs to where the old one would have ended. Caller must hold [lock].
+     */
+    private fun rollOver(previous: FinishedClip, window: ClipWindow) {
+        val target = try {
+            onRollover(previous)
+        } catch (e: Exception) {
+            Log.e(TAG, "Rollover after ${previous.eventId} failed", e)
+            null
+        } ?: return
+        startClip(target, window.requestedEndUs - postRollUs)
+    }
+
+    /** Returns the finished clip, or null if it could not be finalised. Caller must hold [lock]. */
+    private fun finish(clip: ActiveClip): FinishedClip? {
         active = null
         val durationUs = clip.lastPtsUs - clip.window.startUs
         val ok = try {
@@ -177,10 +218,12 @@ class ClipRecorder(
         }
         if (!ok) {
             clip.target.file.delete()
-            return
+            return null
         }
         Log.i(TAG, "Clip ${clip.target.eventId} finished, ${durationUs / 1000} ms")
-        onClipFinished(FinishedClip(clip.target.eventId, clip.target.file, durationUs))
+        val finished = FinishedClip(clip.target.eventId, clip.target.file, durationUs)
+        onClipFinished(finished)
+        return finished
     }
 
     private fun isKeyFrame(data: ByteArray, info: MediaCodec.BufferInfo): Boolean {
