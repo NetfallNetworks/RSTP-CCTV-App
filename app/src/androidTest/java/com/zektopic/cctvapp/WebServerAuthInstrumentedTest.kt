@@ -98,6 +98,15 @@ class WebServerAuthInstrumentedTest {
             getBatteryLevel = { 50 },
             getWifiStrength = { 80 },
             getWebAuthEnabled = { authEnabled },
+            recordApi = object : RecordApi {
+                override fun state() = """{"state":"idle","event_id":null,"tags":[],"elapsed_ms":null,"hold_remaining_ms":null,"ends_in_ms":null,"auto_paused_until_ms":null}"""
+                override fun start(minutes: Int) = state()
+                override fun hold(minutes: Int) = state()
+                override fun stop(pauseAutoMinutes: Int) = state()
+                override fun discard(pauseAutoMinutes: Int) = state()
+                override fun resume() = state()
+                override fun archived(eventId: String): Pair<Int, String> = 404 to """{"result":"not_found"}"""
+            },
             port = WebServer.EPHEMERAL_PORT
         )
         server.start()
