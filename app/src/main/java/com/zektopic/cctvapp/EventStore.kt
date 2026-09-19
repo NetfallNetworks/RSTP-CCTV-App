@@ -251,7 +251,9 @@ class EventStore(
 
     /**
      * Discard of a recording: removes every part of [visitId] and its media, including a
-     * part still being written. Returns events removed.
+     * part still being written. Returns events removed. Parts already released under media
+     * pressure (see [enforceMaxMediaBytes]) are deleted only if still on the device -- the
+     * archive may already have taken them.
      */
     fun discardVisit(visitId: String): Int {
         synchronized(lock) {
@@ -386,15 +388,41 @@ class EventStore(
     /**
      * Drops the oldest events, and their media, until what remains fits in
      * [maxMediaBytes]. The newest event is always kept. Caller must hold [lock].
+     *
+     * Release under pressure: when media is over the cap, every held part (see
+     * attachClip's `held`: still `recording`, clip attached) is first released --
+     * `recording = false`, clip kept -- and is exempt from eviction in this same pass, so
+     * the archive gets a chance to copy it. All held parts go at once rather than just
+     * enough to fit, so a recording's parts still become archivable together. Released
+     * parts still count toward the total, so older events are evicted to make room; on a
+     * later over-cap pass they are ordinary finished events and are evicted like any other.
+     * Without this, one long recording (roughly 4 h at frankie's ~1-1.35 Mbit/s, sooner
+     * with un-archived clips present) would delete its own early parts unseen.
+     *
+     * The cost: Discard of a recording that long can no longer delete the parts already
+     * released here -- once released they may already be archived, and discardVisit only
+     * deletes what is still on the device.
      */
     private fun enforceMaxMediaBytes(events: MutableList<DetectionEvent>): List<DetectionEvent> {
+        val released = mutableSetOf<String>()
+        if (events.sumOf { mediaBytesOf(it) } > maxMediaBytes) {
+            for (i in events.indices) {
+                val e = events[i]
+                if (!e.recording || e.clipFileName == null) continue
+                events[i] = e.copy(recording = false)
+                released += e.id
+            }
+        }
         val newestFirst = events.sortedByDescending { it.startTimeMs }
         var total = 0L
         var full = false
         val keep = mutableListOf<DetectionEvent>()
         for (event in newestFirst) {
             val size = mediaBytesOf(event)
-            if (full || (keep.isNotEmpty() && total + size > maxMediaBytes)) {
+            if (event.id in released) {
+                total += size
+                keep.add(event)
+            } else if (full || (keep.isNotEmpty() && total + size > maxMediaBytes)) {
                 // Everything older goes too, so eviction stays strictly oldest-first.
                 full = true
                 deleteMediaFor(event)
