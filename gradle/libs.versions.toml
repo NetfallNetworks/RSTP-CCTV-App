@@ -25,11 +25,14 @@ recyclerview = "1.3.2"
 #   own RootEncoder dependency at the fork above (no source changes -- RtspServerCamera2
 #   only extends Camera2Base).
 # rootEncoder must equal the SHA rtspServer pins, or Gradle picks between the two
-# arbitrarily. 165122d is RootEncoder's fix/rtsp-stapa-start-codes head (on top of the
-# already-merged eb97684 decouple-camera-capture-size fix on netfall/2.7.2); it is what
-# RTSP-Server's fix/pin-rootencoder-stapa (00f8046) pins.
-rootEncoder = "165122d05c219ceddec466869ab73a2b0038eeff"
-rtspServer = "00f8046f9af9bca2fbbb158cb87cfb48125afeca"
+# arbitrarily. Both forks' PRs are now merged, so these point at the merged heads
+# rather than the pre-merge branch tips (same tree, different commit -- neither
+# merge was a fast-forward): 014f1fd is RootEncoder#2 merged onto netfall/2.7.2
+# (tree-identical to the old fix/rtsp-stapa-start-codes tip, 165122d); 651f764 is
+# RTSP-Server#2 merged onto netfall/1.4.1 (tree-identical to the old
+# fix/pin-rootencoder-stapa tip, 00f8046).
+rootEncoder = "014f1fd6a584c154511542edb157d4225d0060c0"
+rtspServer = "651f7640c4f6fa9e39ad2d4f6d70ee7b42c8b951"
 nanohttpd = "2.3.1"
 # tensorflow-lite-task-vision was frozen at 0.4.4 (Jul 2023) and its
 # libtask_vision_jni.so has 4 KB LOAD alignment, which fails Android 16 KB
