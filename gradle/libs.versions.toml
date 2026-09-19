@@ -10,8 +10,21 @@ constraintlayout = "2.1.4"
 recyclerview = "1.3.2"
 # rtspServer pins rootEncoder transitively -- bump both together.
 # 1.4.2 / 2.8.0 require compileSdk 37, which AGP 9.0.1 does not support.
-rootEncoder = "2.7.2"
-rtspServer = "1.4.1"
+#
+# Both currently point at NetfallNetworks forks, not upstream pedroSG94, pinned to
+# specific commits rather than tags (JitPack builds any public commit SHA directly):
+# - RootEncoder (branch netfall/2.7.2, i.e. upstream 2.7.2 plus our patch) adds
+#   prepareVideoCropped(), used by CctvServerService to stream this camera upright at
+#   its own 4:3 landscape shape (plain prepareVideo() squashes it into a transposed
+#   portrait frame), and turns video stabilization off unless asked for (this HAL
+#   defaults it on, cropping the field of view to 1333x1000 of the 1600x1200 sensor).
+# - RTSP-Server (branch netfall/1.4.1) just repoints its own RootEncoder dependency at
+#   the fork above (no source changes -- RtspServerCamera2 only extends Camera2Base).
+# rootEncoder must equal the SHA rtspServer pins, or Gradle picks between the two
+# arbitrarily. 2abae73 is the pre-squash head of RootEncoder#1, tree-identical to the
+# merged eb97684 on netfall/2.7.2; it is what RTSP-Server's merged b56566c pins.
+rootEncoder = "2abae7392ae948060fbc12efce721f704bc9883c"
+rtspServer = "b56566cedbc6de7a4e2e5c85fe6579886b5e9b1e"
 nanohttpd = "2.3.1"
 # tensorflow-lite-task-vision was frozen at 0.4.4 (Jul 2023) and its
 # libtask_vision_jni.so has 4 KB LOAD alignment, which fails Android 16 KB
@@ -32,8 +45,8 @@ androidx-appcompat = { group = "androidx.appcompat", name = "appcompat", version
 material = { group = "com.google.android.material", name = "material", version.ref = "material" }
 androidx-constraintlayout = { group = "androidx.constraintlayout", name = "constraintlayout", version.ref = "constraintlayout" }
 androidx-recyclerview = { group = "androidx.recyclerview", name = "recyclerview", version.ref = "recyclerview" }
-rootencoder-library = { group = "com.github.pedroSG94.RootEncoder", name = "library", version.ref = "rootEncoder" }
-rtsp-server = { group = "com.github.pedroSG94", name = "RTSP-Server", version.ref = "rtspServer" }
+rootencoder-library = { group = "com.github.NetfallNetworks.RootEncoder", name = "library", version.ref = "rootEncoder" }
+rtsp-server = { group = "com.github.NetfallNetworks", name = "RTSP-Server", version.ref = "rtspServer" }
 nanohttpd = { group = "org.nanohttpd", name = "nanohttpd", version.ref = "nanohttpd" }
 json = { group = "org.json", name = "json", version.ref = "json" }
 mediapipe-tasks-vision = { group = "com.google.mediapipe", name = "tasks-vision", version.ref = "mediapipeTasksVision" }
