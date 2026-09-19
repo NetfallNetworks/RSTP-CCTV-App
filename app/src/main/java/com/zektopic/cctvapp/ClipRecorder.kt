@@ -125,19 +125,26 @@ class ClipRecorder(
         else Trigger(Outcome.UNAVAILABLE)
     }
 
-    /** Extends the open clip's hold by [minutes]. False when nothing is recording. */
+    /**
+     * Adds [minutes] to the open clip's hold, from the later of the current hold and now --
+     * so repeated presses stack rather than one big hold suppressing a shorter later one.
+     * False when nothing is recording.
+     */
     fun hold(minutes: Int): Boolean = synchronized(lock) {
         val clip = active ?: return false
         val nowUs = buffer.newestPtsUs ?: return false
-        clip.window.hold(nowUs + minutes * 60_000_000L)
+        clip.window.hold(maxOf(clip.window.holdUntilUs, nowUs) + minutes * 60_000_000L)
         true
     }
 
-    /** Ends the open clip and keeps it, without triggering a rollover. False when nothing is recording. */
+    /**
+     * Ends the open clip and keeps it, without triggering a rollover. Returns true only when a
+     * clip was open and finalised successfully; false when nothing was recording or the file
+     * could not be finalised (and was deleted).
+     */
     fun stop(): Boolean = synchronized(lock) {
         val clip = active ?: return false
-        finish(clip, keep = true)
-        true
+        finish(clip) != null
     }
 
     /** Ends the open clip and deletes its file. [onClipFinished] is not called. Returns its event id. */
