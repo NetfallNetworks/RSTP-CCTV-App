@@ -315,7 +315,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             },
             onStartStream = {
                 onMain {
-                    if (isSurfaceCreated && (!::rtspServerCamera.isInitialized || !rtspServerCamera.isStreaming)) {
+                    if (!::rtspServerCamera.isInitialized || !rtspServerCamera.isStreaming) {
                         startStream()
                     }
                 }
@@ -947,9 +947,11 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
         val newVideoFps = AppPreferences.getVideoFps(this)
         val newKeyframeIntervalSeconds = AppPreferences.getKeyframeIntervalSeconds(this)
 
-        // Initialize wrapper if needed
+        // Initialize wrapper if needed. Headless constructor: the stream is not bound to
+        // openGlView's surface, so it keeps running while another app (Fully Kiosk) holds
+        // the screen. openGlView still exists for the dashboard's own JPEG snapshots.
         if (!::rtspServerCamera.isInitialized) {
-             rtspServerCamera = RtspServerCamera2(openGlView, this, 8554)
+             rtspServerCamera = RtspServerCamera2(this, this, 8554)
         }
 
         // If already streaming, check if we need to restart due to config change
@@ -1039,9 +1041,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
              updateOverlaySize()
         }
 
-        if (isSurfaceCreated) {
-            startStream()
-        }
+        startStream()
 
         // Apply flashlight and night mode after stream starts
         Handler(Looper.getMainLooper()).postDelayed({
@@ -1053,13 +1053,11 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
     }
 
     private fun startStream() {
-        if (!isSurfaceCreated || !openGlView.holder.surface.isValid) return
-        
         try {
             if (!::rtspServerCamera.isInitialized) {
-                rtspServerCamera = RtspServerCamera2(openGlView, this, 8554)
+                rtspServerCamera = RtspServerCamera2(this, this, 8554)
             }
-            
+
             if (!rtspServerCamera.isStreaming) {
                 // Resolve max resolution if needed
                 if (videoWidth == 0 || videoHeight == 0) {
@@ -1363,10 +1361,11 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
+        // Only the dashboard's JPEG snapshot path (takeSnapshot -> openGlView.takePhoto)
+        // needs this view's surface. The RTSP stream is headless (see the RtspServerCamera2
+        // construction in onStartCommand/startStream) and must keep running when another
+        // app, e.g. Fully Kiosk, takes the screen and tears this overlay's surface down.
         isSurfaceCreated = false
-        if (::rtspServerCamera.isInitialized && rtspServerCamera.isStreaming) {
-            rtspServerCamera.stopStream()
-        }
     }
 
     override fun onDestroy() {
