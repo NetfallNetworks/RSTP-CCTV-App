@@ -30,7 +30,7 @@ object RecordWidget {
     a.innerHTML = '';
     if (s.state === 'recording') {
       var tags = (s.tags || []).join('+');
-      var tail = s.hold_remaining_ms ? 'held ' + mmss(s.hold_remaining_ms) + ' more' : 'ends ~' + mmss(s.ends_in_ms) + ' after activity';
+      var tail = s.hold_remaining_ms ? 'held until ' + clock(Date.now() + s.hold_remaining_ms) : 'ends ~' + mmss(s.ends_in_ms) + ' after activity';
       st.textContent = '● REC · ' + tags + ' · ' + mmss(s.elapsed_ms) + ' · ' + tail;
       st.style.color = '#e74c3c';
       a.appendChild(btn(s.hold_remaining_ms ? '+5 min' : 'Hold 5 min', '/record/hold?minutes=5'));

@@ -34,7 +34,14 @@ class ClipRecorder(
      * extending it. It starts from the pre-roll buffer, so it overlaps the end of the
      * last one rather than leaving a gap. Returning null ends recording there.
      */
-    private val onRollover: (FinishedClip) -> ClipTarget?
+    private val onRollover: (FinishedClip) -> ClipTarget?,
+    /**
+     * The event behind a clip that failed to start (trigger/startManual/rollover) or
+     * finalise (finish, keep=true only -- Discard is intentional and the caller already
+     * has the event id from [discard]'s return). Called from inside [lock]; must not call
+     * back into this ClipRecorder. Default keeps other call sites (tests) compiling.
+     */
+    private val onClipFailed: (eventId: String) -> Unit = {}
 ) : RecordController {
 
     companion object {
@@ -101,7 +108,9 @@ class ClipRecorder(
         }
         if (videoFormat == null || buffer.framesFromKeyFrame().isEmpty()) return unavailable
         val target = open() ?: return unavailable
-        return if (startClip(target, nowUs)) Trigger(Outcome.STARTED, target.eventId) else unavailable
+        if (startClip(target, nowUs)) return Trigger(Outcome.STARTED, target.eventId)
+        onClipFailed(target.eventId)
+        return unavailable
     }
 
     val activeEventId: String? get() = synchronized(lock) { active?.target?.eventId }
@@ -121,8 +130,9 @@ class ClipRecorder(
         if (videoFormat == null || buffer.framesFromKeyFrame().isEmpty()) return Trigger(Outcome.UNAVAILABLE)
         val target = open() ?: return Trigger(Outcome.UNAVAILABLE)
         // A manual clip's detection end is "now": the hold is what keeps it running.
-        return if (startClip(target, nowUs - postRollUs, untilUs)) Trigger(Outcome.STARTED, target.eventId)
-        else Trigger(Outcome.UNAVAILABLE)
+        if (startClip(target, nowUs - postRollUs, untilUs)) return Trigger(Outcome.STARTED, target.eventId)
+        onClipFailed(target.eventId)
+        return Trigger(Outcome.UNAVAILABLE)
     }
 
     /**
@@ -270,7 +280,9 @@ class ClipRecorder(
             Log.e(TAG, "Rollover after ${previous.eventId} failed", e)
             null
         } ?: return
-        startClip(target, window.detectionEndUs - postRollUs, window.holdUntilUs)
+        if (!startClip(target, window.detectionEndUs - postRollUs, window.holdUntilUs)) {
+            onClipFailed(target.eventId)
+        }
     }
 
     /**
@@ -291,6 +303,9 @@ class ClipRecorder(
         }
         if (!ok || !keep) {
             clip.target.file.delete()
+            // Discard (keep=false) is intentional and the caller already has the event id
+            // from discard()'s return; only a finalisation failure is a failure to report.
+            if (!ok && keep) onClipFailed(clip.target.eventId)
             return null
         }
         Log.i(TAG, "Clip ${clip.target.eventId} finished, ${durationUs / 1000} ms")

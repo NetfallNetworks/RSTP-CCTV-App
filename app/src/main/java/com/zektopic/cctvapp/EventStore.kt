@@ -248,6 +248,25 @@ class EventStore(
         }
     }
 
+    /**
+     * Clears event [id]'s recording flag and drops its partial clip, the same recovery
+     * [recoverInterrupted] does at startup -- but immediately, for a clip that failed to
+     * start or finish mid-session, so the event does not stay stuck reporting RECORDING to
+     * /events/<id>/archived until the next restart. Returns false, and changes nothing, if
+     * the event does not exist or was not marked recording.
+     */
+    fun clearRecording(id: String): Boolean {
+        synchronized(lock) {
+            val events = readEventsInternal()
+            val index = events.indexOfFirst { it.id == id }
+            if (index < 0 || !events[index].recording) return false
+            clipFileFor(id).delete()
+            events[index] = events[index].copy(recording = false, clipFileName = null)
+            writeEventsInternal(events)
+            return true
+        }
+    }
+
     private fun removeEvent(id: String): DetectionEvent? {
         synchronized(lock) {
             val events = readEventsInternal()

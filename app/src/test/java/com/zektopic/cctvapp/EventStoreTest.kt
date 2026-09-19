@@ -362,4 +362,30 @@ class EventStoreTest {
         assertNull(eventStore.getEvent(id))
         assertFalse(eventStore.clipFileFor(id).exists())
     }
+
+    @Test
+    fun `clearRecording clears the flag and removes the partial clip`() {
+        val eventStore = store()
+        val event = eventStore.createDetectionEvent("motion", 0.01, jpeg, recording = true)
+        eventStore.clipFileFor(event.id).writeBytes(ByteArray(10))  // a clip that never finalised
+
+        assertTrue(eventStore.clearRecording(event.id))
+
+        val stored = eventStore.getEvent(event.id)!!
+        assertFalse(stored.recording)
+        assertFalse(eventStore.clipFileFor(event.id).exists())
+    }
+
+    @Test
+    fun `clearRecording on an unknown event is a no-op`() {
+        assertFalse(store().clearRecording("no-such-event-id"))
+    }
+
+    @Test
+    fun `clearRecording on an already-finished event is a no-op`() {
+        val eventStore = store()
+        val id = eventWithClip(eventStore, 1_000)  // attachClip already cleared recording
+        assertFalse(eventStore.clearRecording(id))
+        assertNotNull("the finished clip must be left alone", eventStore.getEventClipFile(id))
+    }
 }
