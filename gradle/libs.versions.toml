@@ -14,14 +14,16 @@ recyclerview = "1.3.2"
 # Both currently point at NetfallNetworks forks, not upstream pedroSG94, pinned to
 # specific commits rather than tags (JitPack builds any public commit SHA directly):
 # - RootEncoder @ fix/decouple-camera-capture-size adds prepareVideoCropped(), used by
-#   CctvServerService to get genuine, undistorted 16:9 landscape video from this
-#   device's 4:3-native sensor (cropped, not stretched or padded).
+#   CctvServerService to stream this camera upright at its own 4:3 landscape shape
+#   (plain prepareVideo() squashes it into a transposed portrait frame), and turns
+#   video stabilization off unless asked for (this HAL defaults it on, cropping the
+#   field of view to 1333x1000 of the 1600x1200 sensor).
 # - RTSP-Server @ fix/depend-on-patched-rootencoder just repoints its own RootEncoder
 #   dependency at the fork above (no source changes -- RtspServerCamera2 only extends
 #   Camera2Base, it doesn't touch camera/GL internals).
 # Both branches are otherwise identical to the tags below.
-rootEncoder = "a0b981b48a7ea57cdca9bb5423a31c623bb15fb1"
-rtspServer = "7cf2d6b084bfab050c486fd43923c096ef567d17"
+rootEncoder = "2abae7392ae948060fbc12efce721f704bc9883c"
+rtspServer = "ba4d8167f95a297e0309302dd0f1091dcf111108"
 nanohttpd = "2.3.1"
 # tensorflow-lite-task-vision was frozen at 0.4.4 (Jul 2023) and its
 # libtask_vision_jni.so has 4 KB LOAD alignment, which fails Android 16 KB

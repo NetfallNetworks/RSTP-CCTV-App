@@ -1107,11 +1107,16 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
 
                 // Audio is opt-in. Recording it forces the microphone foreground-service
                 // type and the RECORD_AUDIO grant; a camera-only stream needs neither.
-                if (audioEnabled && hasPermission(android.Manifest.permission.RECORD_AUDIO)) {
+                // disableAudio() alone still leaves an AAC track in the SDP that never gets
+                // a packet, and players that wait for every announced track (ffmpeg does)
+                // stall on it -- setOnlyVideo() drops the track from what's announced.
+                val streamAudio = audioEnabled && hasPermission(android.Manifest.permission.RECORD_AUDIO)
+                if (streamAudio) {
                     rtspServerCamera.prepareAudio(64 * 1024, 44100, true, false, false)
                 } else {
                     rtspServerCamera.disableAudio()
                 }
+                rtspServerCamera.getStreamClient().setOnlyVideo(!streamAudio)
 
                 // Check and set Codec
                 val selectedCodec = when (videoCodec) {
