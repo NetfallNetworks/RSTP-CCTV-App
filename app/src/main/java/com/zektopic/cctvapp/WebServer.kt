@@ -231,12 +231,7 @@ class WebServer(
                 if (parts.size == 3 && parts[2] == "clip.mp4") {
                     val clipFile = getEventClipFile(eventId)
                     return if (clipFile != null && clipFile.exists()) {
-                        newFixedLengthResponse(
-                            Response.Status.OK,
-                            "video/mp4",
-                            FileInputStream(clipFile),
-                            clipFile.length()
-                        )
+                        serveWithRanges(session, clipFile, "video/mp4")
                     } else {
                         newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Clip not found")
                     }
@@ -296,7 +291,11 @@ class WebServer(
 
         if (uri == "/" || uri == "/greet.html") {
             return newFixedLengthResponse(buildDashboardHtml())
-        } 
+        }
+
+        if (uri == "/clips") {
+            return newFixedLengthResponse(ClipsPage.HTML)
+        }
         
         // Legacy redirect
         if (uri.startsWith("/server/")) {
@@ -311,6 +310,37 @@ class WebServer(
         }
 
         return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Not Found")
+    }
+
+    /**
+     * Serves [file] honouring a single `Range: bytes=a-b` request.
+     *
+     * Browsers need this to seek in a video, and MediaMuxer writes the index at the end of
+     * the file, so without it a ten-minute clip has to download completely before it plays.
+     */
+    private fun serveWithRanges(session: IHTTPSession, file: File, mime: String): Response {
+        val length = file.length()
+        val range = when (val r = ByteRange.parse(session.headers["range"], length)) {
+            ByteRange.Whole -> return newFixedLengthResponse(Response.Status.OK, mime, FileInputStream(file), length)
+                .apply { addHeader("Accept-Ranges", "bytes") }
+            ByteRange.Unsatisfiable -> return newFixedLengthResponse(Response.Status.RANGE_NOT_SATISFIABLE, MIME_PLAINTEXT, "")
+                .apply { addHeader("Content-Range", "bytes */$length") }
+            is ByteRange.Span -> r
+        }
+        val start = range.start
+        val end = range.end
+        val input = FileInputStream(file)
+        var skipped = 0L
+        while (skipped < start) {
+            val n = input.skip(start - skipped)
+            if (n <= 0) break
+            skipped += n
+        }
+        val count = end - start + 1
+        return newFixedLengthResponse(Response.Status.PARTIAL_CONTENT, mime, input, count).apply {
+            addHeader("Accept-Ranges", "bytes")
+            addHeader("Content-Range", "bytes $start-$end/$length")
+        }
     }
 
     private fun escapeJson(s: String): String = s.replace("\\", "\\\\").replace("\"", "\\\"")
@@ -704,6 +734,7 @@ class WebServer(
         <div class="header">
             <h1>CCTV Dashboard</h1>
             <div style="display:flex; gap:12px; align-items:center;">
+                <a href="/clips" style="font-size:13px; font-weight:600; color:var(--accent); text-decoration:none;">Clips &rarr;</a>
                 <div style="display:flex; align-items:center; gap:4px; font-size:13px; font-weight:600; color:var(--text-secondary);" title="Battery">
                     <svg viewBox="0 0 24 24" style="width:16px; height:16px; fill:currentColor;"><path d="M15.67 4H14V2h-4v2H8.33C7.6 4 7 4.6 7 5.33v15.33C7 21.4 7.6 22 8.33 22h7.33c.74 0 1.34-.6 1.34-1.33V5.33C17 4.6 16.4 4 15.67 4z"/></svg>
                     <span id="batteryText">—%</span>

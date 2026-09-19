@@ -197,7 +197,11 @@ object AppPreferences {
     private const val KEY_MOTION_SENSITIVITY = "motion_sensitivity"
     private const val KEY_DETECTION_COOLDOWN_SECONDS = "detection_cooldown_seconds"
 
-    const val DEFAULT_MOTION_SENSITIVITY = 5
+    /**
+     * 0.5% of the frame (see MotionDetector.sensitivityToThresholdRatio): biased to
+     * record. Motion starts clips, and a false clip is cheap while a missed animal is not.
+     */
+    const val DEFAULT_MOTION_SENSITIVITY = 9
     const val DEFAULT_DETECTION_COOLDOWN_SECONDS = 10
 
     /** 1 (least sensitive) .. 10 (most sensitive). */
