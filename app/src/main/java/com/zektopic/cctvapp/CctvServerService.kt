@@ -232,8 +232,14 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
      * A recording longer than the per-file cap is saved as consecutive parts sharing a
      * visitId. Every part but the last is attached held (still `recording`, so the archive
      * skips it); whatever ends the recording -- its last part finishing, or a part failing
-     * -- releases the whole visit at once, and Discard deletes the whole visit. All of it
-     * runs in order on [detectionExecutor], so a part's attach always precedes the release.
+     * -- releases the whole visit at once, and Discard deletes the whole visit. In normal
+     * running all of it is posted, in order, to the single-thread [detectionExecutor], so a
+     * part's held attach always runs before the release that ends its recording. The
+     * RejectedExecutionException inline fallback does NOT preserve that order in general:
+     * during shutdown a held attach already queued could run after a release that was
+     * rejected and run inline, leaving that part held. onDestroy narrows this by stopping
+     * the stream (which finishes the open part) before shutting the executor down, and
+     * EventStore.recoverInterrupted releases any stray held part on the next start.
      */
     private val clipRecorder = ClipRecorder(
         onClipFinished = { clip ->

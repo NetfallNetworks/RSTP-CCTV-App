@@ -497,6 +497,43 @@ class EventStoreTest {
     }
 
     @Test
+    fun `over the media cap held parts are released rather than deleted`() {
+        val eventStore = EventStore(tempFolder.root, maxMediaBytes = 2_500)
+        val a1 = part(eventStore)
+        val a2 = part(eventStore, visitId = a1.id)
+        val a3 = part(eventStore, visitId = a1.id)
+        attach(eventStore, a1, held = true)
+        attach(eventStore, a2, held = true)
+        assertTrue("under the cap nothing changes", eventStore.getEvent(a1.id)!!.recording)
+        attach(eventStore, a3, held = true)  // 3 000 bytes: over the cap
+
+        for (e in listOf(a1, a2, a3)) {
+            val stored = eventStore.getEvent(e.id)
+            assertNotNull("a held part is never evicted in the pass that releases it", stored)
+            assertFalse("released so the archive can copy it", stored!!.recording)
+            assertNotNull(eventStore.getEventClipFile(e.id))
+        }
+        assertEquals(ArchiveResult.DELETED, eventStore.archiveEvent(a1.id))
+    }
+
+    @Test
+    fun `a released part is evicted by a later over-cap attach like any finished event`() {
+        val eventStore = EventStore(tempFolder.root, maxMediaBytes = 2_500)
+        val a1 = part(eventStore)
+        val a2 = part(eventStore, visitId = a1.id)
+        val a3 = part(eventStore, visitId = a1.id)
+        attach(eventStore, a1, held = true)
+        attach(eventStore, a2, held = true)
+        attach(eventStore, a3, held = true)  // releases all three
+
+        val later = eventWithClip(eventStore, 1_000)  // 4 000 bytes: evict oldest
+
+        assertEquals(listOf(later, a3.id), eventStore.listRecentEvents(10).map { it.id })
+        assertFalse(eventStore.clipFileFor(a1.id).exists())
+        assertFalse(eventStore.clipFileFor(a2.id).exists())
+    }
+
+    @Test
     fun `clearRecording leaves a held part and its clip alone`() {
         // A rollover that could not open its next part reports the previous (held, attached)
         // part as failed; that must release it through releaseVisit, never delete its clip.
