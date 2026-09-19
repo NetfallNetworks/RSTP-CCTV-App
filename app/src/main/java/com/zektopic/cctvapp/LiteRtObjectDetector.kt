@@ -10,7 +10,9 @@ import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetector
 
 data class LiteRtDetection(
     val label: String,
-    val score: Float
+    val score: Float,
+    /** Normalised 0-1 [left, top, right, bottom], in image coordinates. */
+    val box: List<Float>? = null
 )
 
 /**
@@ -86,11 +88,11 @@ class LiteRtObjectDetector(
         return try {
             val image = BitmapImageBuilder(bitmap).build()
             localDetector.detect(image).detections().flatMap { detection ->
+                val r = detection.boundingBox()
+                val box = listOf(r.left / bitmap.width, r.top / bitmap.height, r.right / bitmap.width, r.bottom / bitmap.height)
+                    .map { it.coerceIn(0f, 1f) }
                 detection.categories().map { category ->
-                    LiteRtDetection(
-                        label = category.categoryName().orEmpty().lowercase(),
-                        score = category.score()
-                    )
+                    LiteRtDetection(category.categoryName().orEmpty().lowercase(), category.score(), box)
                 }
             }
         } catch (t: Throwable) {
