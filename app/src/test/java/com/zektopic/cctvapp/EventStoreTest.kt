@@ -251,7 +251,7 @@ class EventStoreTest {
         val event = eventStore.createDetectionEvent("person", 0.9, jpeg)
         val clip = eventStore.clipFileFor(event.id)
         clip.writeBytes(ByteArray(clipBytes))
-        assertTrue(eventStore.attachClip(event.id, clip, event.startTimeMs + 15_000, 20_000))
+        assertTrue(eventStore.attachClip(event.id, clip, event.startTimeMs + 15_000, 20_000, null, null, null))
         // startTimeMs orders eviction; keep consecutive events distinct.
         Thread.sleep(3)
         return event.id
@@ -272,7 +272,7 @@ class EventStoreTest {
     fun `a clip for an event evicted mid-recording is deleted`() {
         val eventStore = store()
         val orphan = File(mediaDir(), "gone_clip.mp4").apply { writeBytes(ByteArray(10)) }
-        assertFalse(eventStore.attachClip("gone", orphan, 0))
+        assertFalse(eventStore.attachClip("gone", orphan, 0, null, null, null, null))
         assertFalse(orphan.exists())
     }
 
@@ -309,5 +309,57 @@ class EventStoreTest {
         val eventStore = EventStore(tempFolder.root, maxMediaBytes = 500)
         val id = eventWithClip(eventStore, 1_000)
         assertNotNull(eventStore.getEventClipFile(id))
+    }
+
+    // --- archive lifecycle ---
+
+    @Test
+    fun `archiving a recording event is refused`() {
+        val eventStore = store()
+        val event = eventStore.createDetectionEvent("motion", 0.01, jpeg, recording = true)
+        assertEquals(ArchiveResult.RECORDING, eventStore.archiveEvent(event.id))
+        assertNotNull(eventStore.getEvent(event.id))
+    }
+
+    @Test
+    fun `archiving a finished event deletes it and its media`() {
+        val eventStore = store()
+        val id = eventWithClip(eventStore, 1_000)
+        assertEquals(ArchiveResult.DELETED, eventStore.archiveEvent(id))
+        assertNull(eventStore.getEvent(id))
+        assertFalse(eventStore.clipFileFor(id).exists())
+        assertEquals(ArchiveResult.NOT_FOUND, eventStore.archiveEvent(id))
+    }
+
+    @Test
+    fun `attaching a clip records its metadata and ends recording`() {
+        val eventStore = store()
+        val event = eventStore.createDetectionEvent("animal", 0.5, jpeg, recording = true)
+        val clip = eventStore.clipFileFor(event.id).apply { writeBytes(ByteArray(777)) }
+        eventStore.attachClip(event.id, clip, event.startTimeMs + 5_000, 12_000, event.startTimeMs - 5_000, "[]", null)
+        val stored = eventStore.getEvent(event.id)!!
+        assertFalse(stored.recording)
+        assertEquals(777L, stored.clipBytes)
+        assertEquals(event.startTimeMs - 5_000, stored.clipStartMs)
+    }
+
+    @Test
+    fun `an event left recording by a crash is recovered`() {
+        val eventStore = store()
+        val event = eventStore.createDetectionEvent("motion", 0.01, jpeg, recording = true)
+        eventStore.clipFileFor(event.id).writeBytes(ByteArray(10))  // unfinalised MP4
+        assertEquals(1, EventStore(tempFolder.root).recoverInterrupted())
+        val stored = eventStore.getEvent(event.id)!!
+        assertFalse(stored.recording)
+        assertFalse(eventStore.clipFileFor(event.id).exists())
+    }
+
+    @Test
+    fun `discarding removes the event and its media`() {
+        val eventStore = store()
+        val id = eventWithClip(eventStore, 1_000)
+        assertTrue(eventStore.discardEvent(id))
+        assertNull(eventStore.getEvent(id))
+        assertFalse(eventStore.clipFileFor(id).exists())
     }
 }

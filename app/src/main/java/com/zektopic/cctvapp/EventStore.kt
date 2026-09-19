@@ -6,6 +6,8 @@ import org.json.JSONObject
 import java.io.File
 import java.util.UUID
 
+enum class ArchiveResult { DELETED, NOT_FOUND, RECORDING }
+
 /**
  * On-disk store for detection events and their snapshots.
  *
@@ -111,7 +113,8 @@ class EventStore(
         type: String,
         score: Double?,
         snapshotJpeg: ByteArray?,
-        tags: List<String> = listOf(type)
+        tags: List<String> = listOf(type),
+        recording: Boolean = false
     ): DetectionEvent {
         val now = System.currentTimeMillis()
         val id = UUID.randomUUID().toString()
@@ -132,7 +135,8 @@ class EventStore(
             snapshotFileName = snapshotFileName,
             clipFileName = null,
             createdAtMs = now,
-            tags = tags
+            tags = tags,
+            recording = recording
         )
         addEvent(event)
         return event
@@ -190,7 +194,10 @@ class EventStore(
      * media fits under [maxMediaBytes]. Returns false, and deletes the clip, if the event
      * was evicted while its clip was still recording.
      */
-    fun attachClip(id: String, clipFile: File, endTimeMs: Long, durationMs: Long? = null): Boolean {
+    fun attachClip(
+        id: String, clipFile: File, endTimeMs: Long, durationMs: Long?,
+        clipStartMs: Long?, detectionsJson: String?, activityJson: String?
+    ): Boolean {
         synchronized(lock) {
             val events = readEventsInternal()
             val index = events.indexOfFirst { it.id == id }
@@ -199,10 +206,57 @@ class EventStore(
                 return false
             }
             events[index] = events[index].copy(
-                clipFileName = clipFile.name, endTimeMs = endTimeMs, clipDurationMs = durationMs
+                clipFileName = clipFile.name, endTimeMs = endTimeMs, clipDurationMs = durationMs,
+                recording = false, clipBytes = clipFile.length(), clipStartMs = clipStartMs,
+                detectionsJson = detectionsJson, activityJson = activityJson
             )
             writeEventsInternal(enforceMaxMediaBytes(events))
             return true
+        }
+    }
+
+    /** Removes event [id] and its media: a discarded recording. */
+    fun discardEvent(id: String): Boolean = removeEvent(id) != null
+
+    /** The archive has a verified copy of [id]; drop the local one unless it is still recording. */
+    fun archiveEvent(id: String): ArchiveResult {
+        synchronized(lock) {
+            val event = readEventsInternal().firstOrNull { it.id == id } ?: return ArchiveResult.NOT_FOUND
+            if (event.recording) return ArchiveResult.RECORDING
+            removeEvent(id)
+            return ArchiveResult.DELETED
+        }
+    }
+
+    /**
+     * A process killed mid-clip leaves its event marked recording and an MP4 with no
+     * index (MediaMuxer writes it on stop), which nothing can play. Clear the flag and
+     * drop the file so the event archives as snapshot-only. Returns events recovered.
+     */
+    fun recoverInterrupted(): Int {
+        synchronized(lock) {
+            val events = readEventsInternal()
+            var recovered = 0
+            for (i in events.indices) {
+                if (!events[i].recording) continue
+                clipFileFor(events[i].id).delete()
+                events[i] = events[i].copy(recording = false, clipFileName = null)
+                recovered++
+            }
+            if (recovered > 0) writeEventsInternal(events)
+            return recovered
+        }
+    }
+
+    private fun removeEvent(id: String): DetectionEvent? {
+        synchronized(lock) {
+            val events = readEventsInternal()
+            val event = events.firstOrNull { it.id == id } ?: return null
+            deleteMediaFor(event)
+            clipFileFor(id).delete()
+            events.remove(event)
+            writeEventsInternal(events)
+            return event
         }
     }
 
