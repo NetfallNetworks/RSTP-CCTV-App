@@ -6,24 +6,54 @@ import kotlin.math.abs
 class MotionDetector(
     private val sampleSize: Int = 96,
     thresholdRatio: Double = DEFAULT_THRESHOLD_RATIO,
-    private val thresholdDelta: Int = 20
+    private val thresholdDelta: Int = 20,
+    /**
+     * How many analysed frames back the second comparison reaches; at the default two
+     * snapshots a second, 4 is two seconds.
+     */
+    private val lookbackFrames: Int = DEFAULT_LOOKBACK_FRAMES
 ) {
     companion object {
         const val DEFAULT_THRESHOLD_RATIO = 0.08
+        const val DEFAULT_LOOKBACK_FRAMES = 4
 
         /** Sensitivity 1 (least twitchy) maps to this ratio. */
         private const val LEAST_SENSITIVE_RATIO = 0.30
-        /** Sensitivity 10 (most twitchy) maps to this ratio. */
-        private const val MOST_SENSITIVE_RATIO = 0.01
+        /**
+         * Sensitivity 10 (most twitchy) maps to this ratio. Low on purpose: a cat on the
+         * far side of the frame covers well under 1% of a 96x96 sample, and missing an
+         * animal costs more than a false clip. Measured on the Echo Show 5 in a still,
+         * dim room, frame-to-frame noise stayed under 0.1% even 5 s apart.
+         */
+        private const val MOST_SENSITIVE_RATIO = 0.003
 
         /**
          * Maps a 1..10 user-facing sensitivity onto the fraction of the frame that has
          * to change before it counts as motion. Higher sensitivity => lower threshold.
+         *
+         * Geometric, not linear: the useful thresholds span two orders of magnitude, and a
+         * linear scale spent nine of its ten steps above 3%, where small animals never
+         * register. Each step is now the same factor (~1.67x) apart.
          */
         fun sensitivityToThresholdRatio(sensitivity: Int): Double {
             val clamped = sensitivity.coerceIn(1, 10)
             val position = (clamped - 1) / 9.0
-            return LEAST_SENSITIVE_RATIO + position * (MOST_SENSITIVE_RATIO - LEAST_SENSITIVE_RATIO)
+            return LEAST_SENSITIVE_RATIO * Math.pow(MOST_SENSITIVE_RATIO / LEAST_SENSITIVE_RATIO, position)
+        }
+
+        /**
+         * The larger of the change against the previous frame and against the oldest
+         * frame in [history].
+         *
+         * Comparing only consecutive frames, half a second apart, misses slow movement: an
+         * animal creeping across the patio changes almost nothing between two snapshots,
+         * but a good deal over two seconds. [history] is oldest first.
+         */
+        fun changedRatioAgainstHistory(history: List<IntArray>, current: IntArray, thresholdDelta: Int): Double {
+            if (history.isEmpty()) return 0.0
+            val recent = changedRatio(history.last(), current, thresholdDelta)
+            if (history.size == 1) return recent
+            return maxOf(recent, changedRatio(history.first(), current, thresholdDelta))
         }
 
         /**
@@ -60,7 +90,8 @@ class MotionDetector(
     @Volatile
     private var thresholdRatio: Double = thresholdRatio
 
-    private var previousLuma: IntArray? = null
+    /** The last [lookbackFrames] analysed frames, oldest first. */
+    private val history = ArrayDeque<IntArray>()
 
     fun updateSensitivity(sensitivity: Int) {
         thresholdRatio = sensitivityToThresholdRatio(sensitivity)
@@ -73,11 +104,10 @@ class MotionDetector(
             scaled.getPixels(pixels, 0, sampleSize, 0, 0, sampleSize, sampleSize)
 
             val luma = lumaOf(pixels)
-            val prev = previousLuma
-            previousLuma = luma
-            if (prev == null) return 0.0
-
-            return changedRatio(prev, luma, thresholdDelta)
+            val ratio = changedRatioAgainstHistory(history, luma, thresholdDelta)
+            history.addLast(luma)
+            while (history.size > lookbackFrames) history.removeFirst()
+            return ratio
         } finally {
             // createScaledBitmap may return the source itself when no scaling is needed;
             // recycling that would destroy the caller's bitmap mid-pipeline.

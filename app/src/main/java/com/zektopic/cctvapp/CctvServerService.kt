@@ -204,8 +204,46 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
 
     private val currentSnapshot = AtomicReference<ByteArray>(null)
     private val detectionExecutor = Executors.newSingleThreadExecutor()
+    /** Set while a detection pass is queued or running; see runDetectionPipelineIfEnabled. */
+    private val detectionBusy = java.util.concurrent.atomic.AtomicBoolean(false)
     /** Separate from [detectionExecutor]: captioning is slow and must not stall detection. */
     private val captionExecutor = Executors.newSingleThreadExecutor()
+
+    /**
+     * Event clips, cut from the stream encoder's own output. A finished clip arrives on the
+     * encoder thread, so its bookkeeping is handed off rather than done there.
+     */
+    private val clipRecorder = ClipRecorder(
+        onClipFinished = { clip ->
+            val attach = Runnable {
+                eventStore.attachClip(clip.eventId, clip.file, System.currentTimeMillis(), clip.durationUs / 1000)
+            }
+            try {
+                detectionExecutor.execute(attach)
+            } catch (_: java.util.concurrent.RejectedExecutionException) {
+                // Service shutting down: the stream stopping is what finished this clip.
+                attach.run()
+            }
+        },
+        // A clip that hit the length cap mid-activity continues as a new event with the
+        // same tags, so a long visit is still found under what was seen in it.
+        onRollover = { previous ->
+            val prior = eventStore.getEvent(previous.eventId)
+            val type = prior?.type ?: "motion"
+            val event = eventStore.createDetectionEvent(
+                type, prior?.score, currentSnapshot.get(), prior?.tags?.ifEmpty { null } ?: listOf(type)
+            )
+            ClipRecorder.ClipTarget(event.id, eventStore.clipFileFor(event.id))
+        }
+    )
+    /** (eventId, tag) pairs already written; detection thread only. */
+    private val clipTagsApplied = object : LinkedHashSet<Pair<String, String>>() {
+        override fun add(element: Pair<String, String>): Boolean {
+            val added = super.add(element)
+            if (size > 256) remove(first())
+            return added
+        }
+    }
     private val motionDetector = MotionDetector()
     private lateinit var liteRtObjectDetector: LiteRtObjectDetector
     private var eventCaptioner: EventCaptioner? = null
@@ -217,8 +255,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
 
     private val snapshotRunnable = object : Runnable {
         override fun run() {
-            val streaming = ::rtspServerCamera.isInitialized &&
-                rtspServerCamera.isStreaming && isSurfaceCreated
+            val streaming = ::rtspServerCamera.isInitialized && rtspServerCamera.isStreaming
 
             // Capturing + JPEG-encoding twice a second around the clock is the single
             // biggest battery cost in the app, and most of the time nothing consumes the
@@ -779,10 +816,18 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
         return ipv4Address ?: "0.0.0.0"
     }
 
+    /**
+     * Grabs the stream's own picture, for the dashboard and for detection.
+     *
+     * From the headless stream pipeline, not openGlView: that view's surface only exists
+     * while this app is on screen, so with Fully Kiosk in front -- the normal state on the
+     * patio -- snapshots, and with them all detection, silently stopped. This is also
+     * exactly what RTSP clients see: same orientation, same mirror correction.
+     */
     private fun takeSnapshot() {
-        if (!isSurfaceCreated || !::openGlView.isInitialized || !openGlView.holder.surface.isValid) return
+        if (!::rtspServerCamera.isInitialized || !rtspServerCamera.isStreaming) return
         try {
-            openGlView.takePhoto { bitmap -> 
+            rtspServerCamera.getGlInterface().takePhoto { bitmap ->
                 val stream = ByteArrayOutputStream()
                 bitmap.compress(Bitmap.CompressFormat.JPEG, snapshotJpegQuality, stream)
                 val jpeg = stream.toByteArray()
@@ -818,37 +863,82 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
     private fun runDetectionPipelineIfEnabled(snapshotJpeg: ByteArray) {
         if (!detectionEnabled || (!motionDetectionEnabled && !objectDetectionEnabled)) return
 
-        detectionExecutor.execute {
-            var bitmap: Bitmap? = null
-            try {
-                bitmap = decodeForAnalysis(snapshotJpeg) ?: return@execute
+        // Skip this frame while the last one is still being analysed. Snapshots arrive
+        // every 500 ms whatever detection's pace, and object detection on the Echo Show's
+        // CPU is slower than that: queueing every frame built a backlog that only grew,
+        // so detections -- and the clips they start -- landed minutes late.
+        if (!detectionBusy.compareAndSet(false, true)) return
+        val queuedAt = android.os.SystemClock.elapsedRealtime()
 
-                if (motionDetectionEnabled) {
-                    val motion = motionDetector.isMotionDetected(bitmap)
-                    if (motion.first) {
-                        maybeCreateDetectionEvent("motion", motion.second, snapshotJpeg)
+        try {
+            detectionExecutor.execute {
+                var bitmap: Bitmap? = null
+                try {
+                    bitmap = decodeForAnalysis(snapshotJpeg) ?: return@execute
+
+                    if (motionDetectionEnabled) {
+                        val motion = motionDetector.isMotionDetected(bitmap)
+                        if (motion.first) {
+                            recordClip("motion", motion.second, snapshotJpeg)
+                        }
                     }
-                }
 
-                if (objectDetectionEnabled) {
-                    val detections = liteRtObjectDetector.detect(bitmap)
+                    if (objectDetectionEnabled) {
+                        val detections = liteRtObjectDetector.detect(bitmap)
 
-                    detections.filter { it.label == "person" }.maxByOrNull { it.score }?.let {
-                        maybeCreateDetectionEvent("person", it.score.toDouble(), snapshotJpeg)
+                        detections.filter { it.label == "person" }.maxByOrNull { it.score }?.let {
+                            recordClip("person", it.score.toDouble(), snapshotJpeg)
+                        }
+
+                        detections
+                            .filter { it.label in ANIMAL_LABELS }
+                            .maxByOrNull { it.score }
+                            ?.let { recordClip("animal", it.score.toDouble(), snapshotJpeg) }
                     }
-
-                    detections
-                        .filter { it.label in ANIMAL_LABELS }
-                        .maxByOrNull { it.score }
-                        ?.let { maybeCreateDetectionEvent("animal", it.score.toDouble(), snapshotJpeg) }
+                } catch (e: Exception) {
+                    android.util.Log.e("CctvServerService", "Detection pipeline failed", e)
+                } finally {
+                    // Decoded once per frame at up to 2 FPS -- without this the GC churn is
+                    // significant and shows up as dropped frames on low-end devices.
+                    bitmap?.recycle()
+                    detectionBusy.set(false)
+                    android.util.Log.d(
+                        "CctvServerService",
+                        "Detection pass ${android.os.SystemClock.elapsedRealtime() - queuedAt} ms"
+                    )
                 }
-            } catch (e: Exception) {
-                android.util.Log.e("CctvServerService", "Detection pipeline failed", e)
-            } finally {
-                // Decoded once per frame at up to 2 FPS -- without this the GC churn is
-                // significant and shows up as dropped frames on low-end devices.
-                bitmap?.recycle()
             }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            detectionBusy.set(false)
+        }
+    }
+
+    /**
+     * Motion, a person or an animal: start a clip, or keep the open one running and tag it.
+     *
+     * Biased to record: plain motion starts clips too, because slow, intermittent animal
+     * movement often never scores as an animal, and a false clip is cheap next to a missed
+     * or cut-off one. What was seen is kept as tags -- a clip that began as motion becomes
+     * an "animal" event once an animal is detected in it -- so real ones can be found.
+     * One event per clip, created when it opens; detections while it is open extend and
+     * tag it, so there is no cooldown here. With no clip possible (stream just started,
+     * muxer failure) this falls back to the plain snapshot event.
+     */
+    private fun recordClip(type: String, score: Double, snapshotJpeg: ByteArray) {
+        val result = clipRecorder.trigger {
+            val event = eventStore.createDetectionEvent(type, score, snapshotJpeg)
+            // Keeps the fallback below from adding a second event if the muxer then fails.
+            lastEventMsByType[type] = System.currentTimeMillis()
+            captionEventInBackground(event.id, snapshotJpeg)
+            ClipRecorder.ClipTarget(event.id, eventStore.clipFileFor(event.id))
+        }
+        when (result.outcome) {
+            ClipRecorder.Outcome.EXTENDED -> result.eventId?.let { id ->
+                // Motion extends a clip twice a second; only touch the store for a new tag.
+                if (clipTagsApplied.add(id to type)) eventStore.tagEvent(id, type)
+            }
+            ClipRecorder.Outcome.STARTED -> Unit
+            ClipRecorder.Outcome.UNAVAILABLE -> maybeCreateDetectionEvent(type, score, snapshotJpeg)
         }
     }
 
@@ -976,7 +1066,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
         // openGlView's surface, so it keeps running while another app (Fully Kiosk) holds
         // the screen. openGlView still exists for the dashboard's own JPEG snapshots.
         if (!::rtspServerCamera.isInitialized) {
-             rtspServerCamera = RtspServerCamera2(this, this, 8554)
+             rtspServerCamera = newRtspServerCamera()
         }
 
         // If already streaming, check if we need to restart due to config change
@@ -1077,10 +1167,14 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
         return START_STICKY
     }
 
+    /** Headless, so the stream survives Fully Kiosk holding the screen; see onStartCommand. */
+    private fun newRtspServerCamera(): RtspServerCamera2 =
+        RtspServerCamera2(this, this, 8554).also { it.setRecordController(clipRecorder) }
+
     private fun startStream() {
         try {
             if (!::rtspServerCamera.isInitialized) {
-                rtspServerCamera = RtspServerCamera2(this, this, 8554)
+                rtspServerCamera = newRtspServerCamera()
             }
 
             if (!rtspServerCamera.isStreaming) {
@@ -1396,10 +1490,9 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
-        // Only the dashboard's JPEG snapshot path (takeSnapshot -> openGlView.takePhoto)
-        // needs this view's surface. The RTSP stream is headless (see the RtspServerCamera2
-        // construction in onStartCommand/startStream) and must keep running when another
-        // app, e.g. Fully Kiosk, takes the screen and tears this overlay's surface down.
+        // Nothing needs this view's surface any more: the RTSP stream and the snapshots
+        // (see takeSnapshot) both come from the headless pipeline, and must keep running
+        // when another app, e.g. Fully Kiosk, takes the screen and tears this down.
         isSurfaceCreated = false
     }
 

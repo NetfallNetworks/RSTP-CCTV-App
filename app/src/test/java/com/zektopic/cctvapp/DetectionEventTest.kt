@@ -72,6 +72,40 @@ class DetectionEventTest {
         assertEquals("unknown", DetectionEvent.fromJsonObject(json).type)
     }
 
+    @Test
+    fun `tags round trip`() {
+        val original = event().copy(tags = listOf("motion", "animal"))
+        assertEquals(original, DetectionEvent.fromJsonObject(original.toJsonObject()))
+    }
+
+    @Test
+    fun `a more specific tag raises the type`() {
+        val motion = event().copy(type = "motion", tags = listOf("motion"))
+        val tagged = motion.withTag("animal")
+        assertEquals("animal", tagged.type)
+        assertEquals(listOf("motion", "animal"), tagged.tags)
+    }
+
+    @Test
+    fun `a less specific tag is recorded but keeps the type`() {
+        val animal = event().copy(type = "animal", tags = listOf("animal"))
+        val tagged = animal.withTag("motion")
+        assertEquals("animal", tagged.type)
+        assertEquals(listOf("animal", "motion"), tagged.tags)
+    }
+
+    @Test
+    fun `tagging twice is a no-op`() {
+        val animal = event().copy(type = "animal", tags = listOf("animal"))
+        assertEquals(animal, animal.withTag("animal"))
+    }
+
+    @Test
+    fun `entries written before tags existed load with none`() {
+        val json = JSONObject().put("id", "x").put("type", "motion").put("start_time", 1L)
+        assertTrue(DetectionEvent.fromJsonObject(json).tags.isEmpty())
+    }
+
     @Test(expected = org.json.JSONException::class)
     fun `an entry without an id is rejected`() {
         // EventStore relies on this to skip corrupt rows rather than serving a bad id.
