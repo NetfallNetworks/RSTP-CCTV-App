@@ -13,18 +13,23 @@ recyclerview = "1.3.2"
 #
 # Both currently point at NetfallNetworks forks, not upstream pedroSG94, pinned to
 # specific commits rather than tags (JitPack builds any public commit SHA directly):
-# - RootEncoder (branch netfall/2.7.2, i.e. upstream 2.7.2 plus our patch) adds
-#   prepareVideoCropped(), used by CctvServerService to stream this camera upright at
-#   its own 4:3 landscape shape (plain prepareVideo() squashes it into a transposed
-#   portrait frame), and turns video stabilization off unless asked for (this HAL
-#   defaults it on, cropping the field of view to 1333x1000 of the 1600x1200 sensor).
-# - RTSP-Server (branch netfall/1.4.1) just repoints its own RootEncoder dependency at
-#   the fork above (no source changes -- RtspServerCamera2 only extends Camera2Base).
+# - RootEncoder (branch fix/rtsp-stapa-start-codes off netfall/2.7.2, i.e. upstream 2.7.2
+#   plus our patches) adds prepareVideoCropped(), used by CctvServerService to stream
+#   this camera upright at its own 4:3 landscape shape (plain prepareVideo() squashes it
+#   into a transposed portrait frame), turns video stabilization off unless asked for
+#   (this HAL defaults it on, cropping the field of view to 1333x1000 of the 1600x1200
+#   sensor), and strips SPS/PPS start codes before STAP-A packing (without this, every
+#   keyframe in a recording of the RTSP stream carries an empty NAL unit ahead of
+#   SPS/PPS, and the recording fails to decode -- RootEncoder#2).
+# - RTSP-Server (branch fix/pin-rootencoder-stapa off netfall/1.4.1) just repoints its
+#   own RootEncoder dependency at the fork above (no source changes -- RtspServerCamera2
+#   only extends Camera2Base).
 # rootEncoder must equal the SHA rtspServer pins, or Gradle picks between the two
-# arbitrarily. 2abae73 is the pre-squash head of RootEncoder#1, tree-identical to the
-# merged eb97684 on netfall/2.7.2; it is what RTSP-Server's merged b56566c pins.
-rootEncoder = "2abae7392ae948060fbc12efce721f704bc9883c"
-rtspServer = "b56566cedbc6de7a4e2e5c85fe6579886b5e9b1e"
+# arbitrarily. 165122d is RootEncoder's fix/rtsp-stapa-start-codes head (on top of the
+# already-merged eb97684 decouple-camera-capture-size fix on netfall/2.7.2); it is what
+# RTSP-Server's fix/pin-rootencoder-stapa (5ee2557) pins.
+rootEncoder = "165122d05c219ceddec466869ab73a2b0038eeff"
+rtspServer = "5ee2557a9430f51c2d8ef3189869e864234c3281"
 nanohttpd = "2.3.1"
 # tensorflow-lite-task-vision was frozen at 0.4.4 (Jul 2023) and its
 # libtask_vision_jni.so has 4 KB LOAD alignment, which fails Android 16 KB
