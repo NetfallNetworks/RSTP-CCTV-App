@@ -13,18 +13,32 @@ recyclerview = "1.3.2"
 #
 # Both currently point at NetfallNetworks forks, not upstream pedroSG94, pinned to
 # specific commits rather than tags (JitPack builds any public commit SHA directly):
-# - RootEncoder (branch netfall/2.7.2, i.e. upstream 2.7.2 plus our patch) adds
-#   prepareVideoCropped(), used by CctvServerService to stream this camera upright at
-#   its own 4:3 landscape shape (plain prepareVideo() squashes it into a transposed
-#   portrait frame), and turns video stabilization off unless asked for (this HAL
-#   defaults it on, cropping the field of view to 1333x1000 of the 1600x1200 sensor).
-# - RTSP-Server (branch netfall/1.4.1) just repoints its own RootEncoder dependency at
-#   the fork above (no source changes -- RtspServerCamera2 only extends Camera2Base).
+# - RootEncoder (branch fix/rtsp-stapa-start-codes off netfall/2.7.2, i.e. upstream 2.7.2
+#   plus our patches) adds prepareVideoCropped(), used by CctvServerService to stream
+#   this camera upright at its own 4:3 landscape shape (plain prepareVideo() squashes it
+#   into a transposed portrait frame), turns video stabilization off unless asked for
+#   (this HAL defaults it on, cropping the field of view to 1333x1000 of the 1600x1200
+#   sensor), and strips SPS/PPS start codes before STAP-A packing (without this, every
+#   keyframe in a recording of the RTSP stream carries an empty NAL unit ahead of
+#   SPS/PPS, and the recording fails to decode -- RootEncoder#2).
+# - RTSP-Server (branch fix/pin-rootencoder-stapa off netfall/1.4.1) just repoints its
+#   own RootEncoder dependency at the fork above (no source changes -- RtspServerCamera2
+#   only extends Camera2Base).
 # rootEncoder must equal the SHA rtspServer pins, or Gradle picks between the two
-# arbitrarily. 2abae73 is the pre-squash head of RootEncoder#1, tree-identical to the
-# merged eb97684 on netfall/2.7.2; it is what RTSP-Server's merged b56566c pins.
-rootEncoder = "2abae7392ae948060fbc12efce721f704bc9883c"
-rtspServer = "b56566cedbc6de7a4e2e5c85fe6579886b5e9b1e"
+# arbitrarily. Both forks' PRs are now merged (RootEncoder#2 as 014f1fd on
+# netfall/2.7.2, RTSP-Server#2 as 651f764 on netfall/1.4.1), and neither merge was a
+# fast-forward, so 165122d/00f8046 below are no longer reachable from their branch
+# tips. They stay pinned here anyway, deliberately: RTSP-Server's own build (unchanged
+# by its merge -- 651f764 is tree-identical to 00f8046) hardcodes its RootEncoder
+# dependency at exactly 165122d, so bumping our rootEncoder pin to the new merged head
+# (014f1fd) doesn't match that and silently loses the "must equal" invariant above --
+# `:app:dependencies` shows Gradle overriding our 014f1fd request back down to 165122d
+# transitively. 165122d and 00f8046 remain valid forever regardless of branch
+# reachability (JitPack builds any public commit SHA directly, and GitHub never drops
+# commit history reachable by SHA), and both are tree-identical to their merged heads,
+# so nothing is lost by staying pinned to them.
+rootEncoder = "165122d05c219ceddec466869ab73a2b0038eeff"
+rtspServer = "00f8046f9af9bca2fbbb158cb87cfb48125afeca"
 nanohttpd = "2.3.1"
 # tensorflow-lite-task-vision was frozen at 0.4.4 (Jul 2023) and its
 # libtask_vision_jni.so has 4 KB LOAD alignment, which fails Android 16 KB
