@@ -518,8 +518,16 @@ class MainActivity : AppCompatActivity() {
     // startServer() decides the resulting state itself, because it can refuse (missing
     // overlay or camera permission). The listener must not assert `true` afterwards or
     // it overwrites that refusal and leaves the switch on with no service behind it.
+    //
+    // The switch's new position is persisted as the boot-start intent (see
+    // BootStartPolicy) before anything else happens, so it always reflects what the
+    // person actually asked for -- including the case where startServer() goes on to
+    // refuse. This call is safe from feedback loops: updateServerStatus() detaches this
+    // listener before it sets isChecked to reflect a refusal, so that path never
+    // re-enters here and overwrites the intent with the failure.
     private val serverSwitchListener =
         android.widget.CompoundButton.OnCheckedChangeListener { _, isChecked ->
+            AppPreferences.setStartOnBoot(this, isChecked)
             if (isChecked) {
                 startServer()
             } else {
