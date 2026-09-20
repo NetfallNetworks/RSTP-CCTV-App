@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
+import android.provider.Settings
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -15,10 +16,27 @@ import androidx.core.content.ContextCompat
 /**
  * Restarts the camera server after a reboot, when the user has asked for that.
  *
- * Android 14 and later refuse to let a background component start a foreground service
- * whose type is `camera` or `microphone` -- the start throws
- * `ForegroundServiceStartNotAllowedException`. An uncaught throw here crashes the
- * receiver, so the start is guarded and degrades to a tap-to-resume notification.
+ * Two separate Android restrictions apply here, and they are easy to conflate:
+ *
+ * 1. API 31+ refuses to let a background component start a foreground service whose
+ *    type is `camera` or `microphone` at all -- the start throws
+ *    `ForegroundServiceStartNotAllowedException`. `BOOT_COMPLETED` is on Android's own
+ *    exemption list for this one, so it has not been observed here, but the start is
+ *    still guarded against it (and the SecurityException some OEM builds throw
+ *    instead), degrading to a tap-to-resume notification rather than crashing the
+ *    receiver.
+ * 2. API 30+ (Android 11) separately denies the camera/microphone *themselves* to a
+ *    foreground service that was started while the app was in the background --
+ *    logged as "Foreground service started from background can not have
+ *    location/camera/microphone access". This one is NOT on the same exemption list as
+ *    #1 -- `BOOT_COMPLETED` does not exempt it, and neither does declaring
+ *    `foregroundServiceType="camera"` (that only says what the service is allowed to
+ *    ask for, not that a background-started service is allowed to ask). This is the one
+ *    that actually bites here: the service starts fine from `BOOT_COMPLETED`, but if it
+ *    is started directly the camera open is refused and `startStream()` never completes
+ *    -- with nothing thrown at this call site to catch. See [BootCameraAccessPolicy] for
+ *    how this receiver routes around it, and `CctvServerService.startStream()`'s catch
+ *    block for how that failure is kept out of `/status` either way.
  */
 class BootReceiver : BroadcastReceiver() {
 
@@ -26,6 +44,12 @@ class BootReceiver : BroadcastReceiver() {
         private const val TAG = "BootReceiver"
         private const val RESUME_NOTIFICATION_ID = 2
         private const val CHANNEL_ID = "CctvServerChannel"
+
+        /**
+         * Tells [MainActivity] this launch exists only to get the camera server running
+         * from a genuinely foreground context after boot -- see [BootCameraAccessPolicy].
+         */
+        const val ACTION_START_SERVER_FROM_BOOT = "com.zektopic.cctvapp.ACTION_START_SERVER_FROM_BOOT"
     }
 
     override fun onReceive(context: Context, intent: Intent) {
@@ -45,6 +69,61 @@ class BootReceiver : BroadcastReceiver() {
             return
         }
 
+        // Settings.canDrawOverlays has existed since API 23; minSdk here is 24, so it is
+        // always safe to call directly.
+        val canDrawOverlays = Settings.canDrawOverlays(context)
+
+        if (BootCameraAccessPolicy.shouldLaunchActivityForCamera(Build.VERSION.SDK_INT, canDrawOverlays)) {
+            launchActivityToStartServer(context)
+            return
+        }
+
+        if (!BootCameraAccessPolicy.canReachCameraUnattended(Build.VERSION.SDK_INT, canDrawOverlays)) {
+            // Android 11+ with no overlay permission: there is no legal unattended path
+            // left (see BootCameraAccessPolicy's doc). Starting the service directly
+            // would "succeed" -- BOOT_COMPLETED is exempt from restriction #1 above --
+            // while the camera silently fails later with nothing to catch, which is
+            // exactly the bug this branch exists to stop reproducing. Go straight to
+            // asking a human, the same as an outright start failure below.
+            Log.w(TAG, "No unattended path to the camera on this OS/permission combo; prompting the user")
+            notifyResumeRequired(context)
+            return
+        }
+
+        // Pre-Android 11: the while-in-use restriction above does not exist yet, so the
+        // direct start this app used before that OS version still works unchanged.
+        startServiceDirectly(context)
+    }
+
+    /**
+     * Routes the start through a real, resumed [MainActivity] instead of starting
+     * [CctvServerService] directly. `FLAG_ACTIVITY_NEW_TASK` is required from a
+     * non-Activity context; the launch itself is legal from the background here
+     * because the app holds `SYSTEM_ALERT_WINDOW` (verified above) -- a documented
+     * exemption to the *separate* background-activity-start restriction. Once the
+     * Activity is actually resumed, the app is no longer "in the background" for the
+     * while-in-use check, so its own `autoStartServerIfNeeded`-style start (see
+     * `MainActivity.handleBootStartIntent`) reaches the camera normally.
+     */
+    private fun launchActivityToStartServer(context: Context) {
+        val activityIntent = Intent(context, MainActivity::class.java).apply {
+            action = ACTION_START_SERVER_FROM_BOOT
+            addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP
+            )
+        }
+        try {
+            context.startActivity(activityIntent)
+            Log.d(TAG, "Launched MainActivity to start the camera server in the foreground after boot")
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not launch MainActivity after boot; prompting the user instead", e)
+            notifyResumeRequired(context)
+        }
+    }
+
+    private fun startServiceDirectly(context: Context) {
         val serviceIntent = Intent(context, CctvServerService::class.java).apply {
             putExtra("video_codec", AppPreferences.getVideoCodec(context))
             putExtra("width", AppPreferences.getVideoWidth(context))

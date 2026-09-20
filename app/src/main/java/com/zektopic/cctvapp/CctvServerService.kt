@@ -92,6 +92,12 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
     private lateinit var windowManager: WindowManager
     private var isSurfaceCreated = false
 
+    /**
+     * The real "is RTSP actually serving" signal for /status -- see [StreamHealth] for
+     * why `rtspServerCamera.isStreaming` alone is not trustworthy.
+     */
+    private val streamHealth = StreamHealth()
+
     // These are read and written from both the main thread and NanoHTTPD worker
     // threads, so every one of them has to be @Volatile.
     @Volatile private var videoWidth = 640
@@ -524,7 +530,11 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             },
             onStartStream = {
                 onMain {
-                    if (!::rtspServerCamera.isInitialized || !rtspServerCamera.isStreaming) {
+                    // Gated on streamHealth, not the library's own flag: after a failed
+                    // start (e.g. the boot camera-denial case) that flag can be stuck
+                    // true while nothing is actually running, which would make this
+                    // button silently refuse to retry. See StreamHealth.
+                    if (!streamHealth.isStreaming) {
                         startStream()
                     }
                 }
@@ -534,11 +544,11 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                     if (::rtspServerCamera.isInitialized && rtspServerCamera.isStreaming) {
                         rtspServerCamera.stopStream()
                     }
+                    streamHealth.markStopped()
                 }
             },
-            isStreaming = {
-                if (::rtspServerCamera.isInitialized) rtspServerCamera.isStreaming else false
-            },
+            isStreaming = { streamHealth.isStreaming },
+            getStreamError = { streamHealth.lastError },
             onCodecUpdate = { newCodec ->
                 if (videoCodec != newCodec) {
                     videoCodec = newCodec
@@ -912,6 +922,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
     private fun restartStreamIfRunning() {
         if (::rtspServerCamera.isInitialized && rtspServerCamera.isStreaming) {
             rtspServerCamera.stopStream()
+            streamHealth.markStopped()
             startStream()
         }
     }
@@ -1243,6 +1254,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                 keyframeIntervalSeconds != newKeyframeIntervalSeconds
             if (encoderChanged) {
                 rtspServerCamera.stopStream()
+                streamHealth.markStopped()
             } else {
                 if (showPreview != newShowPreview) {
                      showPreview = newShowPreview
@@ -1436,6 +1448,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                     )
                 ) {
                     rtspServerCamera.startStream()
+                    streamHealth.markStarted()
                     applyTimestampOverlay()
                     activeCodec = videoCodec
                     activeBitrateKbps = resolvedKbps
@@ -1463,6 +1476,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                         )
                     ) {
                          rtspServerCamera.startStream()
+                         streamHealth.markStarted()
                          applyTimestampOverlay()
                          // Record that THIS session fell back, but do NOT overwrite the
                          // user's stored choice. prepareVideo can fail transiently -- a
@@ -1478,12 +1492,31 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                          // kbit/s" line, and leaving the last successful value there
                          // describes a stream that no longer exists.
                          activeBitrateKbps = 0
+                         streamHealth.markFailed("H264 fallback preparation also failed")
                          android.util.Log.e("CctvServerService", "H264 fallback preparation also failed.")
                     }
                 }
             }
         } catch (e: Exception) {
             e.printStackTrace()
+            streamHealth.markFailed(e.message ?: e.toString())
+            // rtspServerCamera.startStream() sets the library's own isStreaming flag to
+            // true BEFORE it opens the camera or binds the RTSP port -- if setup throws
+            // (e.g. Android denies camera access to a foreground service started from
+            // the background, see BootCameraAccessPolicy), that flag is left stuck true
+            // forever with nothing to reset it. Left alone, every later call to
+            // startStream() would see rtspServerCamera.isStreaming already true and
+            // refuse to even attempt a retry -- a config-change restart, the dashboard's
+            // Start Stream button, all of it silently do nothing. Reset it here so a
+            // later attempt can actually try again. Guarded: a failure while cleaning up
+            // an already-broken stream must not mask the original exception above.
+            try {
+                if (::rtspServerCamera.isInitialized && rtspServerCamera.isStreaming) {
+                    rtspServerCamera.stopStream()
+                }
+            } catch (stopError: Exception) {
+                android.util.Log.w("CctvServerService", "Cleanup after failed start also failed", stopError)
+            }
         }
     }
 
@@ -1679,6 +1712,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                 e.printStackTrace()
             }
         }
+        streamHealth.markStopped()
 
         detectionExecutor.shutdown()
         try {
