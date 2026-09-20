@@ -282,9 +282,20 @@ object AppPreferences {
     private const val KEY_START_ON_BOOT = "start_on_boot"
     private const val KEY_AUTO_START_ON_LAUNCH = "auto_start_on_launch"
 
-    /** Off by default: a camera server should not silently start itself after a reboot. */
-    fun getStartOnBoot(context: Context): Boolean =
-        prefs(context).getBoolean(KEY_START_ON_BOOT, false)
+    /**
+     * On by default (see [BootStartPolicy]): the Enable Server switch persists its own
+     * position here every time it is toggled, so this is really "what was the switch
+     * last set to" rather than a separate opt-in. A device that has never had the
+     * switch touched -- a fresh install -- resolves to on, because this deployment's
+     * whole point is a camera that comes back without anyone touching it.
+     */
+    fun getStartOnBoot(context: Context): Boolean {
+        val preferences = prefs(context)
+        return BootStartPolicy.resolve(
+            hasStoredValue = preferences.contains(KEY_START_ON_BOOT),
+            storedValue = preferences.getBoolean(KEY_START_ON_BOOT, BootStartPolicy.DEFAULT_START_ON_BOOT)
+        )
+    }
 
     fun setStartOnBoot(context: Context, enabled: Boolean) {
         prefs(context).edit().putBoolean(KEY_START_ON_BOOT, enabled).apply()
