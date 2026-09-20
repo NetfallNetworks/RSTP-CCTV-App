@@ -11,7 +11,7 @@ package com.zektopic.cctvapp
  * string is Kotlin interpolation.
  */
 object ClipsPage {
-    val HTML = """
+    val HTML = ("""
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -67,6 +67,7 @@ object ClipsPage {
     <button class="chip" data-filter="motion">Motion only</button>
     <span class="count" id="count"></span>
   </div>
+  """ + RecordWidget.html("") + """
   <div id="list"><div class="empty">Loading…</div></div>
 </div>
 <script>
@@ -173,5 +174,5 @@ object ClipsPage {
 </script>
 </body>
 </html>
-""".trimIndent()
+""").trimIndent()
 }

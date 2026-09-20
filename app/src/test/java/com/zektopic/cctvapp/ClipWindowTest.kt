@@ -46,6 +46,38 @@ class ClipWindowTest {
         assertFalse(w.cutShort)
         w.extend(200 * second)
         assertTrue(w.cutShort)
-        assertEquals(210 * second, w.requestedEndUs)
+        assertEquals(210 * second, w.detectionEndUs)
+    }
+
+    @Test
+    fun `a hold keeps the clip going past the detection end`() {
+        val w = window()                 // detection end 15 s
+        w.hold(40 * second)
+        assertFalse(w.isOver(39 * second))
+        assertTrue(w.isOver(40 * second + 1))
+    }
+
+    @Test
+    fun `detections carry a clip past an expired hold`() {
+        val w = window()
+        w.hold(20 * second)
+        w.extend(25 * second)            // detection end 35 s
+        assertEquals(35 * second, w.endAtUs)
+    }
+
+    @Test
+    fun `a hold past the cap cuts the file short for rollover`() {
+        val w = window()
+        w.hold(100 * second)             // cap is 60 s
+        assertEquals(60 * second, w.endAtUs)
+        assertTrue(w.cutShort)
+    }
+
+    @Test
+    fun `a hold never shortens`() {
+        val w = window()
+        w.hold(40 * second)
+        w.hold(20 * second)
+        assertEquals(40 * second, w.holdUntilUs)
     }
 }
