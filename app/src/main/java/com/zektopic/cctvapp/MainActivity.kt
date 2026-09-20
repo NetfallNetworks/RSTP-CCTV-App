@@ -96,6 +96,50 @@ class MainActivity : AppCompatActivity() {
         updateNetworkInfo()
         showGeneratedPasswordIfAny()
         autoStartServerIfNeeded()
+        handleBootStartIntent(intent)
+    }
+
+    // BootReceiver launches this Activity (instead of starting CctvServerService
+    // directly) on Android 11+, specifically so this start happens from a genuinely
+    // resumed, foreground Activity -- see BootCameraAccessPolicy. FLAG_ACTIVITY_SINGLE_TOP
+    // means an already-running instance is redelivered the intent here rather than
+    // recreated.
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleBootStartIntent(intent)
+    }
+
+    /**
+     * Starts the camera server on behalf of [BootReceiver]'s [BootReceiver.ACTION_START_SERVER_FROM_BOOT]
+     * launch. Deliberately separate from [autoStartServerIfNeeded]: that one is gated on
+     * the "auto start on launch" preference, a different opt-in from "start on boot"
+     * (the Enable Server switch's own persisted position, see [BootStartPolicy]) --
+     * conflating them would mean boot-start silently stops working for anyone who has
+     * "auto start on launch" turned off, which is the normal default.
+     *
+     * Reuses the exact same [startServer] path the Enable Server switch uses, run from
+     * here specifically because this Activity is now the thing that got the app into
+     * the foreground -- the whole point of routing through it instead of starting the
+     * service straight from the receiver.
+     */
+    private fun handleBootStartIntent(intent: Intent?) {
+        if (intent?.action != BootReceiver.ACTION_START_SERVER_FROM_BOOT) return
+        if (!AppPreferences.getStartOnBoot(this)) return
+        if (binding.switchServer.isChecked) return // already running (e.g. autoStartServerIfNeeded got there first)
+        if (!allPermissionsGranted() || !Settings.canDrawOverlays(this)) return
+
+        binding.switchServer.isChecked = true
+
+        // This app is not the kiosk's intended foreground display (Fully Kiosk Browser
+        // is) -- having used a visible Activity only to reach the foreground for the
+        // camera grant, step back out of the way rather than leaving this settings
+        // screen on top after boot. Posted so it runs after this frame has genuinely
+        // resumed, matching the state the while-in-use exemption above relies on having
+        // reached at all. UNVERIFIED ON HARDWARE: whether this reads as a clean handoff
+        // back to Fully Kiosk, or a visible flash of this app's UI first, needs a real
+        // reboot to confirm.
+        window.decorView.post { moveTaskToBack(true) }
     }
 
     private fun setupViews() {

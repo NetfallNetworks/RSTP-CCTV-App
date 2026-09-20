@@ -15,6 +15,8 @@ class WebServer(
     private val onStartStream: () -> Unit,
     private val onStopStream: () -> Unit,
     private val isStreaming: () -> Boolean,
+    /** The reason the most recent start attempt failed, or null when healthy/never tried. */
+    private val getStreamError: () -> String? = { null },
     private val onCodecUpdate: (String) -> Unit,
     private val getCurrentCodec: () -> String,
     /** What the encoder actually negotiated; differs from the request after a fallback. */
@@ -272,6 +274,11 @@ class WebServer(
         // JSON status endpoint
         if (uri == "/status") {
             val streaming = isStreaming()
+            // Null when healthy (or never started); the reason the most recent start
+            // attempt failed otherwise -- see StreamHealth. Surfaced as a real JSON
+            // null, not the string "null", so a consumer that only reads `streaming`
+            // still gets an honest answer without this field getting in the way.
+            val streamErrorJson = getStreamError()?.let { "\"${escapeJson(it)}\"" } ?: "null"
             val codec = getCurrentCodec()
             val resolution = getCurrentResolution()
             val authEnabled = getAuthEnabled()
@@ -279,6 +286,7 @@ class WebServer(
             val rtspUrl = buildRtspUrl()
             val json = """{
                 "streaming":$streaming,
+                "streamError":$streamErrorJson,
                 "codec":"$codec",
                 "activeCodec":"${getActiveCodec()}",
                 "resolution":"$resolution",
