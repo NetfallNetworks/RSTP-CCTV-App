@@ -324,6 +324,16 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
     }
     private val motionDetector = MotionDetector()
     private lateinit var liteRtObjectDetector: LiteRtObjectDetector
+
+    /**
+     * Filters object-detector hits down to ones worth acting on, dropping repeats of a static
+     * object (a bag over a chair, scored "person" forever) that would otherwise keep the
+     * recorder running indefinitely. See its KDoc for the tolerance and duration this app runs
+     * with live, and why motion detection above is untouched by this -- it is a fully separate
+     * signal, so a suppressed static "person" can never suppress a genuine motion event landing
+     * in the same frame.
+     */
+    private val staticObjectSuppressor = StaticObjectSuppressor()
     private var eventCaptioner: EventCaptioner? = null
     private val lastEventMsByType = mutableMapOf<String, Long>()
     private val snapshotHandler = Handler(Looper.getMainLooper())
@@ -522,6 +532,9 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                     if (::rtspServerCamera.isInitialized) {
                         try {
                             rtspServerCamera.switchCamera()
+                            // A different physical camera means every tracked box refers to
+                            // nothing -- the picture underneath it changed discontinuously.
+                            staticObjectSuppressor.reset()
                         } catch (e: Exception) {
                             android.util.Log.e("CctvServerService", "switchCamera failed", e)
                         }
@@ -714,8 +727,13 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                         AppPreferences.setMotionDetectionEnabled(this, motionDetectionEnabled)
                     }
                     "object_detection_enabled" -> {
+                        val wasEnabled = objectDetectionEnabled
                         objectDetectionEnabled = value.toBoolean()
                         AppPreferences.setObjectDetectionEnabled(this, objectDetectionEnabled)
+                        // Off-then-on can span an arbitrary gap with nothing tracked; a box
+                        // that happens to reappear in the same place afterwards must not
+                        // inherit a stableSinceMs from before the toggle.
+                        if (objectDetectionEnabled && !wasEnabled) staticObjectSuppressor.reset()
                     }
                     "motion_sensitivity" -> {
                         value.toIntOrNull()?.let { sensitivity ->
@@ -987,12 +1005,18 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
         if (!::rtspServerCamera.isInitialized || !rtspServerCamera.isStreaming) return
         try {
             rtspServerCamera.getGlInterface().takePhoto { bitmap ->
+                // Two clocks, deliberately: capturedAtMs (wall clock) is what events, the
+                // timeline and clip tags are keyed by, and is fine to be wrong briefly --
+                // nothing there compares it to itself across a gap. elapsedRealtimeMs is
+                // monotonic and immune to NTP/timezone steps, which is required for
+                // StaticObjectSuppressor -- see its "Clock" KDoc section.
                 val capturedAtMs = System.currentTimeMillis()
+                val elapsedRealtimeMs = android.os.SystemClock.elapsedRealtime()
                 val stream = ByteArrayOutputStream()
                 bitmap.compress(Bitmap.CompressFormat.JPEG, snapshotJpegQuality, stream)
                 val jpeg = stream.toByteArray()
                 currentSnapshot.set(jpeg)
-                runDetectionPipelineIfEnabled(jpeg, capturedAtMs)
+                runDetectionPipelineIfEnabled(jpeg, capturedAtMs, elapsedRealtimeMs)
             }
         } catch (e: Exception) {
             e.printStackTrace()
@@ -1020,7 +1044,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
         return BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, options)
     }
 
-    private fun runDetectionPipelineIfEnabled(snapshotJpeg: ByteArray, capturedAtMs: Long) {
+    private fun runDetectionPipelineIfEnabled(snapshotJpeg: ByteArray, capturedAtMs: Long, elapsedRealtimeMs: Long) {
         if (!detectionEnabled || (!motionDetectionEnabled && !objectDetectionEnabled)) return
 
         // Skip this frame while the last one is still being analysed. Snapshots arrive
@@ -1055,11 +1079,34 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                     if (objectDetectionEnabled) {
                         val detections = liteRtObjectDetector.detect(bitmap)
 
-                        detections.filter { it.label == "person" }.maxByOrNull { it.score }?.let {
+                        // Suppression runs over every "person"/animal hit this frame, not just
+                        // the frame's top scorer -- so a static object sitting at one box is
+                        // judged independently of a second, genuine detection at another box.
+                        // See StaticObjectSuppressor's KDoc for why.
+                        val relevant = detections.filter { it.label == "person" || it.label in ANIMAL_LABELS }
+                        val sightings = relevant.map { StaticObjectSuppressor.Sighting(it.label, it.score, it.box) }
+                        // elapsedRealtimeMs, not capturedAtMs: the suppressor's clock must be
+                        // monotonic (see its KDoc) -- capturedAtMs is wall clock and can jump.
+                        //
+                        // maxGapMs is derived from idleSnapshotIntervalMs, live, on every call
+                        // -- not a constant -- because that interval is user-configurable
+                        // (CaptureProfile.MIN/MAX_IDLE_INTERVAL_MS) and a gap threshold that
+                        // doesn't track it can end up at or under the very cadence it needs to
+                        // survive, which quietly stops suppression from ever engaging. See
+                        // StaticObjectSuppressor's "Call gaps" KDoc.
+                        val active = relevant.zip(
+                            staticObjectSuppressor.activeMask(
+                                sightings,
+                                elapsedRealtimeMs,
+                                maxGapMs = StaticObjectSuppressor.maxGapMsFor(idleSnapshotIntervalMs)
+                            )
+                        ).mapNotNull { (detection, isActive) -> detection.takeIf { isActive } }
+
+                        active.filter { it.label == "person" }.maxByOrNull { it.score }?.let {
                             recordClip("person", it.score.toDouble(), snapshotJpeg, capturedAtMs, it.box)
                         }
 
-                        detections
+                        active
                             .filter { it.label in ANIMAL_LABELS }
                             .maxByOrNull { it.score }
                             ?.let { recordClip("animal", it.score.toDouble(), snapshotJpeg, capturedAtMs, it.box) }
@@ -1173,6 +1220,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             if (::rtspServerCamera.isInitialized) {
                 try {
                     rtspServerCamera.switchCamera()
+                    staticObjectSuppressor.reset()
                 } catch (e: Exception) {
                     e.printStackTrace()
                 }
@@ -1278,12 +1326,16 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                 AppPreferences.setShowDate(this, showDate)
                 AppPreferences.setTimestampPosition(this, timestampPosition)
                 AppPreferences.setTimestampSize(this, timestampSize)
+                val objectDetectionWasEnabled = objectDetectionEnabled
                 detectionEnabled = newDetectionEnabled
                 motionDetectionEnabled = newMotionDetectionEnabled
                 objectDetectionEnabled = newObjectDetectionEnabled
                 AppPreferences.setDetectionEnabled(this, detectionEnabled)
                 AppPreferences.setMotionDetectionEnabled(this, motionDetectionEnabled)
                 AppPreferences.setObjectDetectionEnabled(this, objectDetectionEnabled)
+                // See the single-setting "object_detection_enabled" handler for why: a
+                // reappearing box after an off/on span must not inherit pre-toggle state.
+                if (objectDetectionEnabled && !objectDetectionWasEnabled) staticObjectSuppressor.reset()
                 applyTimestampOverlay()
                 return START_STICKY
             }
@@ -1362,6 +1414,13 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             }
 
             if (!rtspServerCamera.isStreaming) {
+                // A (re)start means whatever the suppressor was tracking may no longer be
+                // true of the picture that's about to come back -- the camera can have moved,
+                // or simply have been off long enough that "static for 90s" is no longer a
+                // claim this app has evidence for. Stale boxes here would otherwise carry a
+                // stableSinceMs from before the gap straight into the new stream.
+                staticObjectSuppressor.reset()
+
                 // Resolve max resolution if needed
                 if (videoWidth == 0 || videoHeight == 0) {
                     val maxRes = getMaxCameraResolution()
