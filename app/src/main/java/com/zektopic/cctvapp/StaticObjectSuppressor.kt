@@ -82,14 +82,29 @@ import kotlin.math.min
  * Detection does not run at a fixed cadence -- snapshots stop while nothing is streaming and
  * slow to an idle interval under thermal/battery throttling, so [activeMask] can go uncalled
  * for anywhere from seconds to minutes. A sighting is only allowed to continue a tracked
- * candidate when it was last confirmed within [maxGapMs] (default 3 s, a few missed passes at
- * this app's ~2 FPS active cadence) of `atMs`. Without this, a person detected for a few
- * seconds, a two-minute stream drop, then a similar re-detection at roughly the same spot would
- * inherit the original [stableSinceMs][Candidate.stableSinceMs] and could be suppressed on the
- * very next frame, with the intervening two minutes of silence counted as if it had been
- * observed continuously. Past the gap, the sighting simply starts a new run -- exactly like a
- * real move (see Ending suppression) -- which is the safe direction: worst case it delays
- * suppression, never a live person.
+ * candidate when it was last confirmed within `maxGapMs` of `atMs`. Without this, a person
+ * detected for a few seconds, a two-minute stream drop, then a similar re-detection at roughly
+ * the same spot would inherit the original [stableSinceMs][Candidate.stableSinceMs] and could
+ * be suppressed on the very next frame, with the intervening two minutes of silence counted as
+ * if it had been observed continuously. Past the gap, the sighting simply starts a new run --
+ * exactly like a real move (see Ending suppression) -- which is the safe direction: worst case
+ * it delays suppression, never a live person.
+ *
+ * **The threshold matters as much as its existence.** A first cut of this fix hardcoded
+ * `maxGapMs` to 3 s -- which is *also* `CaptureProfile.DEFAULT_IDLE_INTERVAL_MS`, this app's
+ * own idle snapshot interval, and the real spacing between idle passes is always somewhat
+ * *more* than that interval (async capture + JPEG encode land after `postDelayed` has already
+ * scheduled the next run -- see `CctvServerService.snapshotRunnable`). A `maxGapMs` sitting
+ * exactly on or under the cadence that is supposed to satisfy it means ordinary idle spacing
+ * alone breaks every run, and suppression never engages at all whenever nobody has the
+ * dashboard open or the device is thermally throttled -- the exact endless-recording bug this
+ * class exists to fix, just with a layer of "looks fixed" on top (recording *does* still stop
+ * once a clip is open, because the active 500 ms cadence comfortably clears a 3 s gap -- but
+ * the run then breaks the moment the cadence drops back to idle, so the bag re-triggers and a
+ * new clip starts: endless 10-minute clips become endless ~90 s ones instead of actually
+ * ending). [maxGapMsFor] derives the threshold from the live idle interval instead, with
+ * headroom for that overhead, so the two cannot silently drift apart again the way a bare
+ * constant did.
  *
  * ### Ending suppression
  * There is no decay timer. Every call rebuilds tracking from scratch out of *this frame's*
@@ -151,7 +166,26 @@ class StaticObjectSuppressor(
         val lastSeenMs: Long
     )
 
-    /** label -> every distinct run currently being tracked for that label. */
+    /**
+     * label -> every distinct run currently being tracked for that label.
+     *
+     * `@Volatile`, not plain -- [activeMask] runs on `CctvServerService`'s single-thread
+     * `detectionExecutor`, but [reset] is called from the main thread (`onMain`,
+     * `onStartCommand`: stream start, camera switch, settings apply). That is exactly the
+     * cross-thread-mutable-state pattern `CctvServerService` itself calls out ("every one of
+     * them has to be @Volatile"), and without it a reset is a plain, non-atomic write with no
+     * happens-before edge to the detection thread's next read -- it can be invisible for an
+     * arbitrary amount of time, or torn against a read-modify-write straddling it, rather than
+     * merely delayed. In practice the gap check in [activeMask] masks most of the damage (a
+     * lost reset just means the *next* sighting has to clear [maxGapMs] again before it can
+     * match), but a camera switch can land inside that gap window and a reset lost to a
+     * visibility race could let a run survive straight through a complete scene change.
+     * `@Volatile` does not make a reset racing an in-flight [activeMask] call atomic with it --
+     * a pass already in progress when [reset] lands can still finish and write back state from
+     * before the reset, which is a bounded, one-pass staleness rather than an unbounded lost
+     * update.
+     */
+    @Volatile
     private var candidatesByLabel: Map<String, List<Candidate>> = emptyMap()
 
     /**
@@ -163,9 +197,12 @@ class StaticObjectSuppressor(
      * A sighting with a null [Sighting.box] cannot be position-tracked at all, so it always
      * comes back active (fails open, matching this app's bias to record) and is not tracked.
      *
-     * [atMs] must be monotonic -- see class doc "Clock".
+     * [atMs] must be monotonic -- see class doc "Clock". [maxGapMs] defaults to the value this
+     * instance was constructed with, but callers that have a live, more accurate figure (see
+     * [maxGapMsFor]) should pass it explicitly rather than relying on a value fixed at
+     * construction time -- see class doc "Call gaps".
      */
-    fun activeMask(sightings: List<Sighting>, atMs: Long): List<Boolean> {
+    fun activeMask(sightings: List<Sighting>, atMs: Long, maxGapMs: Long = this.maxGapMs): List<Boolean> {
         val remainingByLabel = candidatesByLabel.mapValues { it.value.toMutableList() }
         val next = mutableMapOf<String, MutableList<Candidate>>()
         val result = ArrayList<Boolean>(sightings.size)
@@ -232,8 +269,28 @@ class StaticObjectSuppressor(
         const val DEFAULT_STATIC_AFTER_MS = 90_000L
         const val DEFAULT_IOU_THRESHOLD = 0.85
         const val DEFAULT_SCORE_TOLERANCE = 0.005f
-        /** A few missed passes at this app's ~2 FPS active capture cadence -- see "Call gaps". */
-        const val DEFAULT_MAX_GAP_MS = 3_000L
+        /**
+         * Fallback only -- real callers should compute [maxGapMsFor] from the live idle
+         * interval and pass it to [activeMask] explicitly. Derived the same way here so the
+         * constructor default cannot itself fall back below `CaptureProfile`'s own idle
+         * interval -- see class doc "Call gaps" for why that particular failure mode is the
+         * one that matters.
+         */
+        val DEFAULT_MAX_GAP_MS: Long = maxGapMsFor(CaptureProfile.DEFAULT_IDLE_INTERVAL_MS)
+
+        /**
+         * The gap threshold to actually use, given the app's *current* idle snapshot interval
+         * ([CaptureProfile.MIN_IDLE_INTERVAL_MS]..[CaptureProfile.MAX_IDLE_INTERVAL_MS], user
+         * configurable, so this cannot be a constant computed once). See class doc "Call gaps":
+         * the real spacing between idle passes runs somewhat over the configured interval
+         * (async capture + JPEG encode land after the next run is already scheduled), so this
+         * doubles the interval rather than using it as-is -- enough headroom that ordinary idle
+         * spacing, including that overhead, never breaks a run on its own, while a genuine
+         * outage (a stream drop, an extended thermal throttle) still does. Also comfortably
+         * covers active-cadence (500 ms) detection passes running slower than expected, which
+         * the second PR #10 review round flagged as unmeasured on real hardware.
+         */
+        fun maxGapMsFor(idleSnapshotIntervalMs: Int): Long = 2L * idleSnapshotIntervalMs
 
         /**
          * Intersection-over-union of two [left, top, right, bottom] boxes. Pulled out as a

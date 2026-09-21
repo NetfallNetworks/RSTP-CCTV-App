@@ -35,16 +35,23 @@ class CctvServerServiceClockWiringTest {
         return file.readText()
     }
 
+    /**
+     * Matches the first two positional arguments of the `activeMask(...)` call, whatever else
+     * follows (a third `maxGapMs = ...` argument, multi-line formatting, trailing whitespace).
+     * Group 2 is the clock argument this test cares about.
+     */
+    private val activeMaskCallRegex =
+        Regex("""staticObjectSuppressor\.activeMask\(\s*([\w.]+)\s*,\s*([\w.]+)\s*[,)]""")
+
     @Test
     fun `activeMask is called with a monotonic clock argument, not capturedAtMs`() {
         val source = serviceSource()
-        val call = Regex("""staticObjectSuppressor\.activeMask\(\s*[\w.]+,\s*(\w+)\s*\)""")
-            .find(source)
+        val call = activeMaskCallRegex.find(source)
             ?: error(
                 "No staticObjectSuppressor.activeMask(...) call site found -- update this " +
                     "test's regex if the call was refactored."
             )
-        val clockArgument = call.groupValues[1]
+        val clockArgument = call.groupValues[2]
 
         assertTrue(
             "activeMask's clock argument must come from SystemClock.elapsedRealtime() (e.g. " +
@@ -64,9 +71,9 @@ class CctvServerServiceClockWiringTest {
         val source = serviceSource()
         // Find `val elapsedRealtimeMs = <expr>` (or whatever the C1 test above resolved the
         // clock argument's name to) and check its right-hand side.
-        val call = Regex("""staticObjectSuppressor\.activeMask\(\s*[\w.]+,\s*(\w+)\s*\)""").find(source)
+        val call = activeMaskCallRegex.find(source)
             ?: error("No staticObjectSuppressor.activeMask(...) call site found")
-        val clockArgument = call.groupValues[1]
+        val clockArgument = call.groupValues[2]
 
         val assignment = Regex("""val\s+${Regex.escape(clockArgument)}\s*(?::\s*Long)?\s*=\s*([^\n]+)""")
             .find(source)

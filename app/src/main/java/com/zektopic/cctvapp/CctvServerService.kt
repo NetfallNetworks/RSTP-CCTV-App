@@ -1087,8 +1087,20 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                         val sightings = relevant.map { StaticObjectSuppressor.Sighting(it.label, it.score, it.box) }
                         // elapsedRealtimeMs, not capturedAtMs: the suppressor's clock must be
                         // monotonic (see its KDoc) -- capturedAtMs is wall clock and can jump.
-                        val active = relevant.zip(staticObjectSuppressor.activeMask(sightings, elapsedRealtimeMs))
-                            .mapNotNull { (detection, isActive) -> detection.takeIf { isActive } }
+                        //
+                        // maxGapMs is derived from idleSnapshotIntervalMs, live, on every call
+                        // -- not a constant -- because that interval is user-configurable
+                        // (CaptureProfile.MIN/MAX_IDLE_INTERVAL_MS) and a gap threshold that
+                        // doesn't track it can end up at or under the very cadence it needs to
+                        // survive, which quietly stops suppression from ever engaging. See
+                        // StaticObjectSuppressor's "Call gaps" KDoc.
+                        val active = relevant.zip(
+                            staticObjectSuppressor.activeMask(
+                                sightings,
+                                elapsedRealtimeMs,
+                                maxGapMs = StaticObjectSuppressor.maxGapMsFor(idleSnapshotIntervalMs)
+                            )
+                        ).mapNotNull { (detection, isActive) -> detection.takeIf { isActive } }
 
                         active.filter { it.label == "person" }.maxByOrNull { it.score }?.let {
                             recordClip("person", it.score.toDouble(), snapshotJpeg, capturedAtMs, it.box)

@@ -402,4 +402,106 @@ class StaticObjectSuppressorTest {
         val jittered = listOf(0.303f, 0.097f, 0.767f, 0.653f)
         assertTrue(StaticObjectSuppressor.iou(original, jittered) >= StaticObjectSuppressor.DEFAULT_IOU_THRESHOLD)
     }
+
+    // ---------------------------------------------------------------------------------------
+    // PR #10 review round 2, Important 2 -- maxGapMs must never sit at or under the idle
+    // cadence it has to survive, or suppression silently stops engaging while idle.
+    // ---------------------------------------------------------------------------------------
+
+    @Test
+    fun `maxGapMsFor always exceeds the idle interval it is derived from, across the whole configurable range`() {
+        // This is the relationship that broke: a hardcoded maxGapMs (3s) happened to equal
+        // CaptureProfile.DEFAULT_IDLE_INTERVAL_MS (also 3s) exactly, and the real spacing
+        // between idle passes is always somewhat MORE than the configured interval (async
+        // capture + JPEG encode land after the next run is already scheduled -- see
+        // CctvServerService.snapshotRunnable), so ordinary idle spacing alone broke every run
+        // and suppression never engaged at all. This must hold everywhere the idle interval is
+        // user-configurable to, not just at the default.
+        for (idleIntervalMs in listOf(
+            CaptureProfile.MIN_IDLE_INTERVAL_MS,
+            CaptureProfile.DEFAULT_IDLE_INTERVAL_MS,
+            CaptureProfile.MAX_IDLE_INTERVAL_MS,
+            1_500,
+            17_000
+        )) {
+            val maxGapMs = StaticObjectSuppressor.maxGapMsFor(idleIntervalMs)
+            assertTrue(
+                "maxGapMsFor($idleIntervalMs) = $maxGapMs must clear the interval itself with " +
+                    "real margin, or ordinary idle-cadence spacing alone would break every run " +
+                    "and suppression would silently stop engaging",
+                maxGapMs > idleIntervalMs
+            )
+        }
+    }
+
+    @Test
+    fun `the constructor default maxGapMs also exceeds CaptureProfile's default idle interval`() {
+        // Guards the fallback path directly (StaticObjectSuppressor() with no arguments) --
+        // this must never regress back to a bare constant that happens to equal, or fall
+        // under, the interval it is meant to survive.
+        assertTrue(StaticObjectSuppressor.DEFAULT_MAX_GAP_MS > CaptureProfile.DEFAULT_IDLE_INTERVAL_MS)
+    }
+
+    @Test
+    fun `a static object is still suppressed at the app's real idle cadence -- the bug this fix targets`() {
+        // Idle spacing in the real app is the configured interval PLUS async capture/encode
+        // overhead (see CaptureProfile's "Call gaps" note), never exactly the bare interval.
+        // Using maxGapMsFor's own derivation (not a hand-picked test constant) proves the
+        // production wiring, not just a number that happens to work.
+        val idleIntervalMs = CaptureProfile.DEFAULT_IDLE_INTERVAL_MS
+        val realisticIdleSpacingMs = idleIntervalMs + 400L // async capture + JPEG encode overhead
+        val suppressor = StaticObjectSuppressor(
+            staticAfterMs = 90_000L,
+            maxGapMs = StaticObjectSuppressor.maxGapMsFor(idleIntervalMs)
+        )
+        val stillSighting = sighting(score = bagScore, box = bagBox)
+
+        var t = 0L
+        var everSuppressed = false
+        while (t <= 150_000L) {
+            val mask = suppressor.activeMask(listOf(stillSighting), atMs = t)
+            if (!mask.single()) everSuppressed = true
+            t += realisticIdleSpacingMs
+        }
+
+        assertTrue(
+            "at the app's real idle cadence (interval + realistic async overhead), a static " +
+                "object must still eventually be suppressed. If this is false, maxGapMs is too " +
+                "tight for the cadence that actually drives it and the endless-clip bug is " +
+                "back -- just delayed until the dashboard is closed or the device throttles.",
+            everSuppressed
+        )
+    }
+
+    @Test
+    fun `the OLD hardcoded 3s maxGapMs would have failed against realistic idle spacing -- this is the regression that matters`() {
+        // Directly demonstrates why "maxGapMs = 3_000L" (equal to, not greater than,
+        // CaptureProfile.DEFAULT_IDLE_INTERVAL_MS) was wrong: at real idle spacing (interval +
+        // overhead), no two consecutive calls are ever close enough together to match, so a
+        // run can never accumulate any duration and NOTHING is ever suppressed -- the previous
+        // suite passed while this sat in the file.
+        val idleIntervalMs = CaptureProfile.DEFAULT_IDLE_INTERVAL_MS
+        val realisticIdleSpacingMs = idleIntervalMs + 400L
+        val suppressorWithOldHardcodedGap = StaticObjectSuppressor(
+            staticAfterMs = 90_000L,
+            maxGapMs = 3_000L
+        )
+        val stillSighting = sighting(score = bagScore, box = bagBox)
+
+        var t = 0L
+        var everSuppressed = false
+        while (t <= 150_000L) {
+            val mask = suppressorWithOldHardcodedGap.activeMask(listOf(stillSighting), atMs = t)
+            if (!mask.single()) everSuppressed = true
+            t += realisticIdleSpacingMs
+        }
+
+        assertTrue(
+            "this pins the failure mode itself: with the old hardcoded 3s gap, realistic idle " +
+                "spacing (3400ms) always exceeds it, so a run can never survive one idle tick " +
+                "and suppression never engages -- if this assertion ever fails, it means " +
+                "maxGapMs regressed back to being too tight for idle cadence",
+            !everSuppressed
+        )
+    }
 }
