@@ -42,21 +42,31 @@ class AudioPreRollBufferTest {
     @Test
     fun `reading does not consume`() {
         val buffer = AudioPreRollBuffer(preRollUs = 5 * second, maxBytes = Long.MAX_VALUE)
-        feed(buffer, frames = 80)
+        feed(buffer, frames = 80) // well within the 5 s window: nothing trimmed, all 80 kept
         val first = buffer.framesFrom(0)
-        assertEquals(first.size, buffer.framesFrom(0).size)
+        // Fixed, independently-known expectation -- not "vacuously true if both reads
+        // happen to come back empty", which a regression that broke buffering entirely
+        // would not catch.
+        assertEquals(80, first.size)
+        assertEquals(first.map { it.ptsUs }, buffer.framesFrom(0).map { it.ptsUs })
     }
 
     @Test
-    fun `framesFrom drops anything before the floor`() {
+    fun `framesFrom drops anything before the floor, keeps everything at or after it`() {
         val buffer = AudioPreRollBuffer(preRollUs = 60 * second, maxBytes = Long.MAX_VALUE)
-        feed(buffer, frames = 100, stepUs = 100_000L) // 100 ms apart, 10 s total
-        val floor = 5 * second
-        val kept = buffer.framesFrom(floor)
-        assertTrue(kept.isNotEmpty())
-        assertTrue(kept.all { it.ptsUs >= floor })
-        // Nothing earlier than the floor slipped through.
-        assertEquals(kept.size, buffer.framesFrom(0).count { it.ptsUs >= floor })
+        feed(buffer, frames = 10, stepUs = 1 * second) // pts 0, 1s, 2s, ..., 9s; nothing trimmed
+        val kept = buffer.framesFrom(floorUs = 5 * second)
+        // Hand-computed expectation, independent of framesFrom's own filter predicate --
+        // asserting against a value computed by re-running that same predicate would only
+        // prove framesFrom agrees with itself, not that it does the right thing.
+        assertEquals(listOf(5L, 6L, 7L, 8L, 9L).map { it * second }, kept.map { it.ptsUs })
+    }
+
+    @Test
+    fun `framesFrom at the oldest pts keeps everything`() {
+        val buffer = AudioPreRollBuffer(preRollUs = 60 * second, maxBytes = Long.MAX_VALUE)
+        feed(buffer, frames = 5, stepUs = 1 * second)
+        assertEquals(listOf(0L, 1L, 2L, 3L, 4L).map { it * second }, buffer.framesFrom(0).map { it.ptsUs })
     }
 
     @Test

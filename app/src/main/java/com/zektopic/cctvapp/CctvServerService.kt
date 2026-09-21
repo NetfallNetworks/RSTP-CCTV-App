@@ -1220,8 +1220,16 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
         val newDetectionEnabled = intent?.getBooleanExtra("detection_enabled", AppPreferences.getDetectionEnabled(this)) ?: false
         val newMotionDetectionEnabled = intent?.getBooleanExtra("motion_detection_enabled", AppPreferences.getMotionDetectionEnabled(this)) ?: true
         val newObjectDetectionEnabled = intent?.getBooleanExtra("object_detection_enabled", AppPreferences.getObjectDetectionEnabled(this)) ?: true
-        audioEnabled = intent?.getBooleanExtra("audio_enabled", AppPreferences.getAudioEnabled(this))
+        val newAudioEnabled = intent?.getBooleanExtra("audio_enabled", AppPreferences.getAudioEnabled(this))
             ?: AppPreferences.getAudioEnabled(this)
+        // Compared against the old value below (encoderChanged) before being overwritten,
+        // the same way videoCodec/newVideoCodec etc. are -- otherwise a change arriving
+        // through this Intent path (rather than the "audio_enabled" /action/set-setting
+        // branch, which already forces its own restart) would update the field but never
+        // reach prepareAudio()/disableAudio() or clipRecorder.setAudioExpected(), since
+        // those only run when the stream is (re)started.
+        val audioSettingChanged = audioEnabled != newAudioEnabled
+        audioEnabled = newAudioEnabled
         AppPreferences.setAudioEnabled(this, audioEnabled)
         motionDetector.updateSensitivity(AppPreferences.getMotionSensitivity(this))
 
@@ -1251,7 +1259,8 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                 encoderImplementation != newEncoderImplementation ||
                 bitrateKbps != newBitrateKbps ||
                 videoFps != newVideoFps ||
-                keyframeIntervalSeconds != newKeyframeIntervalSeconds
+                keyframeIntervalSeconds != newKeyframeIntervalSeconds ||
+                audioSettingChanged
             if (encoderChanged) {
                 rtspServerCamera.stopStream()
                 streamHealth.markStopped()
@@ -1379,19 +1388,29 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                 // disableAudio() alone still leaves an AAC track in the SDP that never gets
                 // a packet, and players that wait for every announced track (ffmpeg does)
                 // stall on it -- setOnlyVideo() drops the track from what's announced.
-                val streamAudio = audioEnabled && hasPermission(android.Manifest.permission.RECORD_AUDIO)
-                // Same boolean that decides prepareAudio()/disableAudio() and setOnlyVideo()
-                // below -- it is the only place that actually knows whether an AAC format
-                // and samples are coming, so it is what tells ClipRecorder whether to wait
-                // for one before starting a clip's muxer. Set before prepareVideo/prepareAudio
-                // so it is in place before the fresh setVideoFormat/setAudioFormat calls that
-                // (re)starting the stream is about to produce.
-                clipRecorder.setAudioExpected(streamAudio)
-                if (streamAudio) {
-                    rtspServerCamera.prepareAudio(64 * 1024, 44100, true, false, false)
-                } else {
+                //
+                // wantAudio is the setting's intent; prepareAudio()'s return is whether the
+                // microphone actually came up. It returns false (and never fires an audio
+                // format) when MicrophoneManager.createMicrophone() fails to reach
+                // AudioRecord.STATE_INITIALIZED -- notably, the app-op behind
+                // RECORD_AUDIO can be denied by Android 11's foreground-service
+                // while-in-use restriction (see BootCameraAccessPolicy) even though
+                // hasPermission() reports the manifest grant as present. Trusting intent
+                // alone here previously left the stream (and /status) looking healthy
+                // while every clip silently recorded with no audio track ever added,
+                // forever -- see ClipRecorder.tracksReady().
+                val wantAudio = audioEnabled && hasPermission(android.Manifest.permission.RECORD_AUDIO)
+                val streamAudio = wantAudio && rtspServerCamera.prepareAudio(64 * 1024, 44100, true, false, false)
+                if (!streamAudio) {
                     rtspServerCamera.disableAudio()
                 }
+                // Same boolean that decided prepareAudio()/disableAudio() and (below)
+                // setOnlyVideo() -- it reflects whether the microphone actually initialised,
+                // not merely whether it was asked to, so it is what tells ClipRecorder
+                // whether to wait for an audio format before starting a clip's muxer. Set
+                // before setVideoFormat/setAudioFormat land, so it is in place before the
+                // fresh formats that (re)starting the stream is about to produce.
+                clipRecorder.setAudioExpected(streamAudio)
                 rtspServerCamera.getStreamClient().setOnlyVideo(!streamAudio)
 
                 // Check and set Codec
