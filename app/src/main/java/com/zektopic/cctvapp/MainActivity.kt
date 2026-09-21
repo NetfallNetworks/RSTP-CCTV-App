@@ -535,6 +535,7 @@ class MainActivity : AppCompatActivity() {
         // Load saved flashlight & night mode settings
         binding.switchFlashlight.isChecked = AppPreferences.getFlashlightEnabled(this)
         binding.switchNightMode.isChecked = AppPreferences.getNightModeEnabled(this)
+        binding.switchHdr.isChecked = AppPreferences.getHdrEnabled(this)
 
         // Load detection settings
         binding.switchDetectionEnabled.isChecked = AppPreferences.getDetectionEnabled(this)
@@ -715,6 +716,17 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        binding.switchHdr.setOnCheckedChangeListener { _, isChecked ->
+            AppPreferences.setHdrEnabled(this, isChecked)
+            if (binding.switchServer.isChecked) {
+                val intent = Intent(this, CctvServerService::class.java).apply {
+                    action = "ACTION_TOGGLE_HDR"
+                    putExtra("hdr_enabled", isChecked)
+                }
+                startService(intent)
+            }
+        }
+
         binding.switchDetectionEnabled.setOnCheckedChangeListener { _, isChecked ->
             AppPreferences.setDetectionEnabled(this, isChecked)
             restartServer()
@@ -831,6 +843,7 @@ class MainActivity : AppCompatActivity() {
             putExtra("timestamp_size", binding.spinnerOverlaySize.text.toString())
             putExtra("flashlight_enabled", binding.switchFlashlight.isChecked)
             putExtra("night_mode_enabled", binding.switchNightMode.isChecked)
+            putExtra("hdr_enabled", binding.switchHdr.isChecked)
             putExtra("detection_enabled", binding.switchDetectionEnabled.isChecked)
             putExtra("motion_detection_enabled", binding.switchMotionDetection.isChecked)
             putExtra("object_detection_enabled", binding.switchObjectDetection.isChecked)

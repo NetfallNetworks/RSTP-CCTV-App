@@ -152,6 +152,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
     @Volatile private var timestampSize = "Medium"
     @Volatile private var flashlightEnabled = false
     @Volatile private var nightModeEnabled = false
+    @Volatile private var hdrEnabled = false
     @Volatile private var detectionEnabled = false
     @Volatile private var motionDetectionEnabled = true
     @Volatile private var objectDetectionEnabled = true
@@ -476,6 +477,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
         timestampSize = AppPreferences.getTimestampSize(this)
         flashlightEnabled = AppPreferences.getFlashlightEnabled(this)
         nightModeEnabled = AppPreferences.getNightModeEnabled(this)
+        hdrEnabled = AppPreferences.getHdrEnabled(this)
         detectionEnabled = AppPreferences.getDetectionEnabled(this)
         motionDetectionEnabled = AppPreferences.getMotionDetectionEnabled(this)
         objectDetectionEnabled = AppPreferences.getObjectDetectionEnabled(this)
@@ -627,6 +629,11 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                         AppPreferences.setNightModeEnabled(this, nightModeEnabled)
                         onMain { updateNightModeSensor() }
                     }
+                    "hdr_enabled" -> {
+                        hdrEnabled = value.toBoolean()
+                        AppPreferences.setHdrEnabled(this, hdrEnabled)
+                        onMain { applyHdr() }
+                    }
                     // Legacy key. Still accepted because NVR setups and scripts built
                     // against the old dashboard send it, and silently ignoring it would
                     // break them with no error to go on.
@@ -754,6 +761,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             getTimestampSize = { timestampSize },
             getFlashlightEnabled = { flashlightEnabled },
             getNightModeEnabled = { nightModeEnabled },
+            getHdrEnabled = { hdrEnabled },
             getForceSoftware = { encoderImplementation == EncoderImplementation.SOFTWARE },
             getEncoderImplementation = { encoderImplementation.storedValue },
             getActiveEncoderImplementation = { activeEncoderImplementation.storedValue },
@@ -1251,6 +1259,13 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             return START_STICKY
         }
 
+        if (intent?.action == "ACTION_TOGGLE_HDR") {
+            hdrEnabled = intent.getBooleanExtra("hdr_enabled", false)
+            AppPreferences.setHdrEnabled(this, hdrEnabled)
+            applyHdr()
+            return START_STICKY
+        }
+
         val newVideoCodec = intent?.getStringExtra("video_codec") ?: AppPreferences.getVideoCodec(this)
         val newShowPreview = intent?.getBooleanExtra("show_preview", AppPreferences.getShowPreview(this)) ?: false
         val newWidth = intent?.getIntExtra("width", AppPreferences.getVideoWidth(this)) ?: 640
@@ -1381,10 +1396,13 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
         // Update flashlight & night mode settings
         val newFlashlightEnabled = intent?.getBooleanExtra("flashlight_enabled", AppPreferences.getFlashlightEnabled(this)) ?: false
         val newNightModeEnabled = intent?.getBooleanExtra("night_mode_enabled", AppPreferences.getNightModeEnabled(this)) ?: false
+        val newHdrEnabled = intent?.getBooleanExtra("hdr_enabled", AppPreferences.getHdrEnabled(this)) ?: false
         flashlightEnabled = newFlashlightEnabled
         nightModeEnabled = newNightModeEnabled
+        hdrEnabled = newHdrEnabled
         AppPreferences.setFlashlightEnabled(this, flashlightEnabled)
         AppPreferences.setNightModeEnabled(this, nightModeEnabled)
+        AppPreferences.setHdrEnabled(this, hdrEnabled)
 
         if (showPreview != newShowPreview) {
              showPreview = newShowPreview
@@ -1398,6 +1416,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
         Handler(Looper.getMainLooper()).postDelayed({
             applyFlashlight()
             updateNightModeSensor()
+            applyHdr()
         }, 1000)
 
         return START_STICKY
@@ -1726,6 +1745,36 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
         } catch (e: Exception) {
             android.util.Log.e("CctvServerService", "Failed to toggle flashlight", e)
         }
+    }
+
+    /**
+     * Applies the HDR scene-mode setting to the running camera, the same way
+     * [applyFlashlight] applies the flashlight setting via `enableLantern()`/`disableLantern()`.
+     *
+     * Currently a no-op: `Camera2Base.enableHdrSceneMode()`/`disableHdrSceneMode()` were added
+     * in RootEncoder PR #3 (NetfallNetworks/RootEncoder), which is not yet merged, and this
+     * app pins RootEncoder by commit SHA (see gradle/libs.versions.toml) -- so the call cannot
+     * be made without either pointing the pin at an unmerged commit or breaking the build.
+     *
+     * Once RootEncoder#3 merges and both the RTSP-Server and this app's pins are bumped to
+     * include it (see the RootEncoder PR for the required order), this becomes:
+     *
+     * ```
+     * if (!::rtspServerCamera.isInitialized || !rtspServerCamera.isStreaming) return
+     * try {
+     *     if (hdrEnabled) rtspServerCamera.enableHdrSceneMode()
+     *     else rtspServerCamera.disableHdrSceneMode()
+     * } catch (e: Exception) {
+     *     android.util.Log.e("CctvServerService", "Failed to toggle HDR scene mode", e)
+     * }
+     * ```
+     *
+     * The setting itself (preference, `/action/set-setting` key, dashboard toggle, `/status`
+     * field) is fully wired regardless, so flipping it on today safely does nothing, and no
+     * further app-side plumbing is needed once the dependency lands.
+     */
+    private fun applyHdr() {
+        // See kdoc above: intentionally no-op until the RootEncoder pin is bumped.
     }
 
     private val lightSensorListener = object : SensorEventListener {

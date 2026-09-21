@@ -167,6 +167,25 @@ object AppPreferences {
         prefs(context).edit().putBoolean(KEY_NIGHT_MODE_ENABLED, enabled).apply()
     }
 
+    // --- HDR (scene mode) ---
+    private const val KEY_HDR_ENABLED = "hdr_enabled"
+
+    /**
+     * Off by default. This camera is a fixed indoor/outdoor deployment (see the patio
+     * kiosk placement), and HDR is not always wanted: android.control.availableSceneModes
+     * HDR (scene mode 18) forces CONTROL_MODE to USE_SCENE_MODE, which hands AE/AWB
+     * behaviour to the scene mode implementation and can look worse in a low-dynamic-range
+     * scene than a manually tuned exposure. Turning it on is a deliberate choice for a
+     * high-contrast scene (e.g. a bright sky against a dark porch), not a universal
+     * improvement.
+     */
+    fun getHdrEnabled(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_HDR_ENABLED, false)
+
+    fun setHdrEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_HDR_ENABLED, enabled).apply()
+    }
+
     // --- Detection ---
     private const val KEY_DETECTION_ENABLED = "detection_enabled"
     private const val KEY_MOTION_DETECTION_ENABLED = "motion_detection_enabled"

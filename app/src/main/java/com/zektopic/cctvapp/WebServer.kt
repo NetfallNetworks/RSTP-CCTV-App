@@ -34,6 +34,8 @@ class WebServer(
     private val getTimestampSize: () -> String,
     private val getFlashlightEnabled: () -> Boolean,
     private val getNightModeEnabled: () -> Boolean,
+    /** Standard CONTROL_SCENE_MODE_HDR (scene mode 18); off by default, see AppPreferences. */
+    private val getHdrEnabled: () -> Boolean,
     /** Retained for dashboards and NVR scripts written against the old boolean. */
     private val getForceSoftware: () -> Boolean,
     private val getEncoderImplementation: () -> String,
@@ -299,6 +301,7 @@ class WebServer(
                 "timestampSize":"${getTimestampSize()}",
                 "flashlightEnabled":${getFlashlightEnabled()},
                 "nightModeEnabled":${getNightModeEnabled()},
+                "hdrEnabled":${getHdrEnabled()},
                 "forceSoftware":${getForceSoftware()},
                 "encoderImplementation":"${getEncoderImplementation()}",
                 "activeEncoderImplementation":"${getActiveEncoderImplementation()}",
@@ -1058,6 +1061,16 @@ class WebServer(
                     <span class="toggle-track"></span>
                 </label>
             </div>
+            <div class="setting-row">
+                <div>
+                    <span class="setting-label">HDR</span>
+                    <div class="setting-sublabel">Standard scene-mode HDR; not always desirable, use for high-contrast scenes</div>
+                </div>
+                <label class="toggle">
+                    <input type="checkbox" id="toggleHdr" onchange="setSetting('hdr_enabled', this.checked)">
+                    <span class="toggle-track"></span>
+                </label>
+            </div>
         </div>
 
         <!-- Detection -->
@@ -1240,6 +1253,7 @@ class WebServer(
                     document.getElementById('sizeSelect').value = data.timestampSize;
                     document.getElementById('toggleFlashlight').checked = data.flashlightEnabled;
                     document.getElementById('toggleNightMode').checked = data.nightModeEnabled;
+                    document.getElementById('toggleHdr').checked = data.hdrEnabled;
                     document.getElementById('toggleDetectionEnabled').checked = data.detectionEnabled;
                     document.getElementById('toggleMotionDetection').checked = data.motionDetectionEnabled;
                     document.getElementById('toggleObjectDetection').checked = data.objectDetectionEnabled;
