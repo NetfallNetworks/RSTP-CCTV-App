@@ -1380,6 +1380,13 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                 // a packet, and players that wait for every announced track (ffmpeg does)
                 // stall on it -- setOnlyVideo() drops the track from what's announced.
                 val streamAudio = audioEnabled && hasPermission(android.Manifest.permission.RECORD_AUDIO)
+                // Same boolean that decides prepareAudio()/disableAudio() and setOnlyVideo()
+                // below -- it is the only place that actually knows whether an AAC format
+                // and samples are coming, so it is what tells ClipRecorder whether to wait
+                // for one before starting a clip's muxer. Set before prepareVideo/prepareAudio
+                // so it is in place before the fresh setVideoFormat/setAudioFormat calls that
+                // (re)starting the stream is about to produce.
+                clipRecorder.setAudioExpected(streamAudio)
                 if (streamAudio) {
                     rtspServerCamera.prepareAudio(64 * 1024, 44100, true, false, false)
                 } else {

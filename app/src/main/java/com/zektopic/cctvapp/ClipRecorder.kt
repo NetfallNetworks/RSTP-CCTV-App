@@ -16,13 +16,19 @@ import java.nio.ByteBuffer
  *
  * Installed with setRecordController(). RootEncoder hands every encoded stream frame to the
  * record controller whether or not anything is recording, so this sees exactly the H.264
- * that RTSP clients get -- same orientation and mirror fixes, no extra encode, no extra
- * heat. It keeps the last few seconds in a [PreRollBuffer]; [trigger] opens an MP4 that
- * starts with that buffer, and each further trigger pushes the end out (see [ClipWindow]).
+ * (and, when the stream carries it, AAC) that RTSP clients get -- same orientation and
+ * mirror fixes, no extra encode, no extra heat. It keeps the last few seconds of each track
+ * in a [PreRollBuffer] / [AudioPreRollBuffer]; [trigger] opens an MP4 that starts with that
+ * buffer, and each further trigger pushes the end out (see [ClipWindow]).
+ *
+ * Audio is opt-in at the stream level (see CctvServerService's audio setting and the
+ * RECORD_AUDIO permission), and RootEncoder only ever calls [setAudioFormat] / [recordAudio]
+ * when the stream actually has an audio track. [setAudioExpected] is how this class is told
+ * whether to wait for one before starting a clip's muxer at all -- see [TrackReadiness]. When
+ * no audio is expected, clips record exactly as before: video-only, no wait.
  *
  * To RootEncoder this is always an idle controller -- [isRecording] and [isRunning] are
- * false -- so stopStream() still tears the encoders down as normal. Video only: the stream
- * carries no audio by default, and a clip does not need it to be useful.
+ * false -- so stopStream() still tears the encoders down as normal.
  */
 class ClipRecorder(
     preRollUs: Long = DEFAULT_PRE_ROLL_US,
@@ -61,6 +67,9 @@ class ClipRecorder(
 
         /** Ceiling for the pre-roll; several times what 7 s at stream bitrates needs. */
         private const val MAX_BUFFER_BYTES = 16L * 1024 * 1024
+
+        /** AAC at 64 kbps for a few seconds' pre-roll is tiny; this is generous headroom. */
+        private const val MAX_AUDIO_BUFFER_BYTES = 2L * 1024 * 1024
         private const val H264_NAL_IDR = 5
     }
 
@@ -91,17 +100,29 @@ class ClipRecorder(
     private class ActiveClip(
         val target: ClipTarget,
         val muxer: MediaMuxer,
-        val track: Int,
+        val videoTrack: Int,
+        /** Null when this clip has no audio track (audio not expected for this stream). */
+        val audioTrack: Int?,
         val window: ClipWindow,
         /** Wall-clock time of the first frame: now minus the pre-roll already buffered. */
         val clipStartMs: Long
     ) {
-        var lastPtsUs = Long.MIN_VALUE
+        var lastVideoPtsUs = Long.MIN_VALUE
+        var lastAudioPtsUs = Long.MIN_VALUE
     }
 
     private val lock = Any()
     private val buffer = PreRollBuffer(preRollUs, MAX_BUFFER_BYTES)
+    private val audioPreRoll = AudioPreRollBuffer(preRollUs, MAX_AUDIO_BUFFER_BYTES)
     private var videoFormat: MediaFormat? = null
+    private var audioFormat: MediaFormat? = null
+    /**
+     * Told explicitly by CctvServerService from the same decision that prepares (or
+     * disables) audio on the stream itself -- see [setAudioExpected]. Never inferred from a
+     * timeout: that would either delay every clip's start waiting for audio that never
+     * comes, or race a real audio format that just hasn't arrived yet.
+     */
+    private var audioExpected = false
     private var active: ActiveClip? = null
     private var videoCodec = VideoCodec.H264
     private var audioCodec = AudioCodec.AAC
@@ -117,7 +138,7 @@ class ClipRecorder(
             it.window.extend(nowUs)
             return Trigger(Outcome.EXTENDED, it.target.eventId)
         }
-        if (videoFormat == null || buffer.framesFromKeyFrame().isEmpty()) return unavailable
+        if (!tracksReady() || buffer.framesFromKeyFrame().isEmpty()) return unavailable
         val target = open() ?: return unavailable
         if (startClip(target, nowUs)) return Trigger(Outcome.STARTED, target.eventId)
         onClipFailed(target.eventId)
@@ -125,6 +146,21 @@ class ClipRecorder(
     }
 
     val activeEventId: String? get() = synchronized(lock) { active?.target?.eventId }
+
+    /**
+     * Declares whether this stream's audio will arrive at all, before any clip can start.
+     * Call this from the same place that decides whether to prepareAudio()/disableAudio()
+     * and setOnlyVideo() on the stream itself -- that decision (the audio setting on, and
+     * RECORD_AUDIO granted) is the one place this is actually knowable. Left at its default
+     * (false), clips record video-only, exactly as before this class had audio support.
+     */
+    fun setAudioExpected(expected: Boolean) = synchronized(lock) {
+        audioExpected = expected
+    }
+
+    /** See [TrackReadiness]. Caller must hold [lock]. */
+    private fun tracksReady(): Boolean =
+        TrackReadiness.ready(videoFormat != null, audioExpected, audioFormat != null)
 
     /**
      * Manual "Record now": opens a clip held for [minutes], or holds the one already open.
@@ -138,7 +174,7 @@ class ClipRecorder(
             it.window.hold(untilUs)
             return Trigger(Outcome.EXTENDED, it.target.eventId)
         }
-        if (videoFormat == null || buffer.framesFromKeyFrame().isEmpty()) return Trigger(Outcome.UNAVAILABLE)
+        if (!tracksReady() || buffer.framesFromKeyFrame().isEmpty()) return Trigger(Outcome.UNAVAILABLE)
         val target = open() ?: return Trigger(Outcome.UNAVAILABLE)
         // A manual clip's detection end is "now": the hold is what keeps it running.
         if (startClip(target, nowUs - postRollUs, untilUs)) return Trigger(Outcome.STARTED, target.eventId)
@@ -192,28 +228,45 @@ class ClipRecorder(
     /**
      * Opens [target] and writes the pre-roll into it, ending [postRollUs] after
      * [triggeredAtUs] unless extended. Caller must hold [lock].
+     *
+     * The clip's whole presentation timeline is anchored at the video pre-roll's first
+     * frame ([ClipWindow.startUs]) -- video and audio timestamps are both written as
+     * `ptsUs - startUs`, one shared clock rather than independent per-track offsets, which
+     * is what keeps the two from drifting apart across a long clip. Audio pre-roll is
+     * trimmed to that same floor ([AudioPreRollBuffer.framesFrom]) so the clip never opens
+     * with audio that precedes its first video frame.
      */
     private fun startClip(target: ClipTarget, triggeredAtUs: Long, holdUntilUs: Long = Long.MIN_VALUE): Boolean {
         val format = videoFormat ?: return false
+        if (!tracksReady()) return false
         val frames = buffer.framesFromKeyFrame()
         if (frames.isEmpty()) return false
 
         var muxer: MediaMuxer? = null
         return try {
             muxer = MediaMuxer(target.file.path, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-            val track = muxer.addTrack(format)
+            val videoTrack = muxer.addTrack(format)
+            val audioTrack = if (audioExpected) muxer.addTrack(audioFormat!!) else null
             muxer.start()
             val newestUs = buffer.newestPtsUs ?: frames.last().ptsUs
-            val clipStartMs = System.currentTimeMillis() - (newestUs - frames.first().ptsUs) / 1000
+            val startUs = frames.first().ptsUs
+            val clipStartMs = System.currentTimeMillis() - (newestUs - startUs) / 1000
             val clip = ActiveClip(
-                target, muxer, track,
-                ClipWindow(postRollUs, maxClipUs, frames.first().ptsUs, triggeredAtUs),
+                target, muxer, videoTrack, audioTrack,
+                ClipWindow(postRollUs, maxClipUs, startUs, triggeredAtUs),
                 clipStartMs
             )
-            for (frame in frames) write(clip, frame)
+            for (frame in frames) writeVideo(clip, frame)
+            if (audioTrack != null) {
+                for (frame in audioPreRoll.framesFrom(startUs)) writeAudio(clip, frame)
+            }
             clip.window.hold(holdUntilUs)
             active = clip
-            Log.i(TAG, "Clip ${target.eventId} started with ${frames.size} pre-roll frames")
+            Log.i(
+                TAG,
+                "Clip ${target.eventId} started with ${frames.size} pre-roll frames" +
+                    if (audioTrack != null) " (+audio)" else ""
+            )
             true
         } catch (e: Exception) {
             Log.e(TAG, "Could not start clip ${target.eventId}", e)
@@ -240,9 +293,32 @@ class ClipRecorder(
                 return
             }
             try {
-                write(clip, frame)
+                writeVideo(clip, frame)
             } catch (e: Exception) {
                 Log.e(TAG, "Write failed, closing clip ${clip.target.eventId}", e)
+                finish(clip)
+            }
+        }
+    }
+
+    override fun recordAudio(audioBuffer: ByteBuffer, audioInfo: MediaCodec.BufferInfo) {
+        if (audioInfo.size <= 0 || audioInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) return
+        val source = audioBuffer.duplicate().apply { rewind() }
+        val data = ByteArray(source.remaining())
+        source.get(data)
+        val frame = AudioPreRollBuffer.Frame(data, audioInfo.presentationTimeUs)
+
+        synchronized(lock) {
+            audioPreRoll.add(frame)
+            // The window (end-of-clip, rollover) is driven entirely by video pts -- audio
+            // just rides along on whichever clip video currently has open, or is dropped
+            // (like a video frame arriving with nothing active) when there isn't one.
+            val clip = active ?: return
+            if (clip.audioTrack == null) return
+            try {
+                writeAudio(clip, frame)
+            } catch (e: Exception) {
+                Log.e(TAG, "Audio write failed, closing clip ${clip.target.eventId}", e)
                 finish(clip)
             }
         }
@@ -251,10 +327,21 @@ class ClipRecorder(
     override fun setVideoFormat(videoFormat: MediaFormat) {
         synchronized(lock) {
             // A new format means a new encoder session; frames from the old one can
-            // neither start nor continue a clip in it.
+            // neither start nor continue a clip in it. Audio goes with it too: a clip's
+            // two tracks are added to one muxer together, so either format changing
+            // invalidates whatever pre-roll is buffered for the other as well.
             active?.let { finish(it) }
             buffer.clear()
+            audioPreRoll.clear()
             this.videoFormat = videoFormat
+        }
+    }
+
+    override fun setAudioFormat(audioFormat: MediaFormat) {
+        synchronized(lock) {
+            active?.let { finish(it) }
+            audioPreRoll.clear()
+            this.audioFormat = audioFormat
         }
     }
 
@@ -263,21 +350,34 @@ class ClipRecorder(
         synchronized(lock) {
             active?.let { finish(it) }
             buffer.clear()
+            audioPreRoll.clear()
             videoFormat = null
+            audioFormat = null
         }
     }
 
-    private fun write(clip: ActiveClip, frame: PreRollBuffer.Frame) {
-        // MediaMuxer rejects non-increasing timestamps.
-        if (frame.ptsUs <= clip.lastPtsUs) return
+    private fun writeVideo(clip: ActiveClip, frame: PreRollBuffer.Frame) {
+        // MediaMuxer rejects non-increasing timestamps, per track.
+        if (frame.ptsUs <= clip.lastVideoPtsUs) return
         val info = MediaCodec.BufferInfo().apply {
             set(
                 0, frame.data.size, frame.ptsUs - clip.window.startUs,
                 if (frame.isKeyFrame) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
             )
         }
-        clip.muxer.writeSampleData(clip.track, ByteBuffer.wrap(frame.data), info)
-        clip.lastPtsUs = frame.ptsUs
+        clip.muxer.writeSampleData(clip.videoTrack, ByteBuffer.wrap(frame.data), info)
+        clip.lastVideoPtsUs = frame.ptsUs
+    }
+
+    private fun writeAudio(clip: ActiveClip, frame: AudioPreRollBuffer.Frame) {
+        val track = clip.audioTrack ?: return
+        // Same non-decreasing rule as video, tracked independently per track.
+        if (frame.ptsUs <= clip.lastAudioPtsUs) return
+        val info = MediaCodec.BufferInfo().apply {
+            set(0, frame.data.size, frame.ptsUs - clip.window.startUs, 0)
+        }
+        clip.muxer.writeSampleData(track, ByteBuffer.wrap(frame.data), info)
+        clip.lastAudioPtsUs = frame.ptsUs
     }
 
     /**
@@ -310,7 +410,9 @@ class ClipRecorder(
      */
     private fun finish(clip: ActiveClip, keep: Boolean = true, continued: Boolean = false): FinishedClip? {
         active = null
-        val durationUs = clip.lastPtsUs - clip.window.startUs
+        // Video remains the clip's canonical clock; audio may run a sample or two ahead
+        // or behind it and does not change the reported duration.
+        val durationUs = clip.lastVideoPtsUs - clip.window.startUs
         val ok = try {
             clip.muxer.stop()
             true
@@ -352,8 +454,6 @@ class ClipRecorder(
     }
 
     override fun stopRecord() {}
-    override fun recordAudio(audioBuffer: ByteBuffer, audioInfo: MediaCodec.BufferInfo) {}
-    override fun setAudioFormat(audioFormat: MediaFormat) {}
     override fun isRunning(): Boolean = false
     override fun isRecording(): Boolean = false
     override fun pauseRecord() {}
