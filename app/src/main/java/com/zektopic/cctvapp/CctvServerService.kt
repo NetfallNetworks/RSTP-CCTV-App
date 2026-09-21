@@ -324,6 +324,16 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
     }
     private val motionDetector = MotionDetector()
     private lateinit var liteRtObjectDetector: LiteRtObjectDetector
+
+    /**
+     * Filters object-detector hits down to ones worth acting on, dropping repeats of a static
+     * object (a bag over a chair, scored "person" forever) that would otherwise keep the
+     * recorder running indefinitely. See its KDoc for the tolerance and duration this app runs
+     * with live, and why motion detection above is untouched by this -- it is a fully separate
+     * signal, so a suppressed static "person" can never suppress a genuine motion event landing
+     * in the same frame.
+     */
+    private val staticObjectSuppressor = StaticObjectSuppressor()
     private var eventCaptioner: EventCaptioner? = null
     private val lastEventMsByType = mutableMapOf<String, Long>()
     private val snapshotHandler = Handler(Looper.getMainLooper())
@@ -1055,11 +1065,20 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                     if (objectDetectionEnabled) {
                         val detections = liteRtObjectDetector.detect(bitmap)
 
-                        detections.filter { it.label == "person" }.maxByOrNull { it.score }?.let {
+                        // Suppression runs over every "person"/animal hit this frame, not just
+                        // the frame's top scorer -- so a static object sitting at one box is
+                        // judged independently of a second, genuine detection at another box.
+                        // See StaticObjectSuppressor's KDoc for why.
+                        val relevant = detections.filter { it.label == "person" || it.label in ANIMAL_LABELS }
+                        val sightings = relevant.map { StaticObjectSuppressor.Sighting(it.label, it.score, it.box) }
+                        val active = relevant.zip(staticObjectSuppressor.activeMask(sightings, capturedAtMs))
+                            .mapNotNull { (detection, isActive) -> detection.takeIf { isActive } }
+
+                        active.filter { it.label == "person" }.maxByOrNull { it.score }?.let {
                             recordClip("person", it.score.toDouble(), snapshotJpeg, capturedAtMs, it.box)
                         }
 
-                        detections
+                        active
                             .filter { it.label in ANIMAL_LABELS }
                             .maxByOrNull { it.score }
                             ?.let { recordClip("animal", it.score.toDouble(), snapshotJpeg, capturedAtMs, it.box) }
