@@ -1458,8 +1458,38 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                 // alone here previously left the stream (and /status) looking healthy
                 // while every clip silently recorded with no audio track ever added,
                 // forever -- see ClipRecorder.tracksReady().
+                //
+                // isStereo=false: this device's microphone is a mono far-field array (see
+                // dumpsys media.audio_flinger -- the HAL input thread runs at 16000 Hz,
+                // which AudioFlinger resamples to the 44100 requested here; separately, it
+                // is a single-channel voice mic, not a stereo music input). Requesting
+                // isStereo=true against a mono source does NOT fail -- AudioRecord still
+                // reaches STATE_INITIALIZED -- it just gets fed half as many real stereo
+                // frames as the requested channel mask implies, so every consecutive pair
+                // of mono samples is read back as one L/R frame. The AAC frame count (and
+                // therefore the audio actually encoded) ends up at half of what the
+                // written wall-clock timestamps claim, which played back as ~2x speed
+                // ("chipmunks") despite the clip's audio and video track durations
+                // matching each other -- container duration is derived from the pts we
+                // write, not from the sample count, so that check can never catch this.
+                // See the audio-mono-fix PR description for the exact arithmetic.
+                //
+                // There's no clean way to *ask* the hardware here instead of asserting it:
+                // RootEncoder's prepareAudio()/MicrophoneManager.createMicrophone() take
+                // isStereo as a caller-supplied channel mask and hand it straight to
+                // AudioRecord -- there's no capability query in the fork, and
+                // AudioRecord.getState() reaching STATE_INITIALIZED (the only signal
+                // prepareAudio surfaces) is exactly what stayed green while this bug shipped,
+                // so it can't be trusted to confirm the mask matches the hardware.
+                // AudioManager.getMicrophones()/MicrophoneInfo (API 28+) exists, but is
+                // widely unreliable across OEM HALs (missing/placeholder channel mappings
+                // are common) and would need a minSdk-24 fallback anyway -- trusting a flaky
+                // device query over the direct measurement already in hand (this device's
+                // clips, analysed sample-by-sample) would be a downgrade, not an
+                // improvement. Hardcoding mono here reflects a measured fact about this
+                // hardware, not a guess.
                 val wantAudio = audioEnabled && hasPermission(android.Manifest.permission.RECORD_AUDIO)
-                val streamAudio = wantAudio && rtspServerCamera.prepareAudio(64 * 1024, 44100, true, false, false)
+                val streamAudio = wantAudio && rtspServerCamera.prepareAudio(64 * 1024, 44100, false, false, false)
                 if (!streamAudio) {
                     rtspServerCamera.disableAudio()
                 }
