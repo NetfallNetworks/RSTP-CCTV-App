@@ -43,14 +43,14 @@ recyclerview = "1.3.2"
 # below are bumped to match: rootEncoder = the RootEncoder SHA, rtspServer = the
 # RTSP-Server SHA that itself pins that same RootEncoder SHA. Verify with
 # `:app:dependencies` after any future bump here -- don't just assume the two agree.
-rootEncoder = "622284165d6dd17b1861d9f2cdfccf004b91af62"
-# Short SHA, deliberately: JitPack keys builds by the exact version string, so
-# "5f724ceaa2" and "5f724ceaa2f5e370d58c186496602b2c4d8c1281" are different artifacts
-# with separate build records. The full SHA's build failed (429 fetching RootEncoder
-# from JitPack itself) and JitPack caches failures forever; the rebuild landed under
-# the short SHA. Same commit -- the build API reports
-# commit=5f724ceaa2f5e370d58c186496602b2c4d8c1281 for this version.
-rtspServer = "5f724ceaa2"
+rootEncoder = "05ed5aca56def2dde53a5f8bdfa3bfd09b712d59"
+# JitPack keys builds by the exact version string, so a short SHA and a full SHA are
+# different artifacts for the same commit, with separate build records. The previous
+# pin had to name the short SHA because the full SHA's build had failed (429 fetching
+# RootEncoder from JitPack itself) and JitPack caches failures permanently. Both
+# spellings of this commit resolve, so it is pinned in full -- but if a future bump
+# will not resolve, check the other spelling before concluding the build failed.
+rtspServer = "09234ac23a3ff1ba3837092e9c71bd44aa179ac6"
 nanohttpd = "2.3.1"
 # tensorflow-lite-task-vision was frozen at 0.4.4 (Jul 2023) and its
 # libtask_vision_jni.so has 4 KB LOAD alignment, which fails Android 16 KB
