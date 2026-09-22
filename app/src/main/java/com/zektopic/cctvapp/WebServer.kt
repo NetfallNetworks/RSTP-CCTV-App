@@ -36,6 +36,11 @@ class WebServer(
     private val getNightModeEnabled: () -> Boolean,
     /** Standard CONTROL_SCENE_MODE_HDR (scene mode 18); off by default, see AppPreferences. */
     private val getHdrEnabled: () -> Boolean,
+    /** CONTROL_AE_COMPENSATION steps, not EV; 0 by default, see AppPreferences. */
+    private val getExposureCompensation: () -> Int,
+    /** From Camera2Base.getMinExposure()/getMaxExposure(); both 0 until the camera inits. */
+    private val getExposureCompensationMin: () -> Int,
+    private val getExposureCompensationMax: () -> Int,
     /** Retained for dashboards and NVR scripts written against the old boolean. */
     private val getForceSoftware: () -> Boolean,
     private val getEncoderImplementation: () -> String,
@@ -302,6 +307,9 @@ class WebServer(
                 "flashlightEnabled":${getFlashlightEnabled()},
                 "nightModeEnabled":${getNightModeEnabled()},
                 "hdrEnabled":${getHdrEnabled()},
+                "exposureCompensation":${getExposureCompensation()},
+                "exposureCompensationMin":${getExposureCompensationMin()},
+                "exposureCompensationMax":${getExposureCompensationMax()},
                 "forceSoftware":${getForceSoftware()},
                 "encoderImplementation":"${getEncoderImplementation()}",
                 "activeEncoderImplementation":"${getActiveEncoderImplementation()}",
@@ -674,6 +682,21 @@ class WebServer(
         }
         .toggle input:checked + .toggle-track { background: var(--accent); }
         .toggle input:checked + .toggle-track::before { transform: translateX(20px); }
+
+        /* Range slider (exposure compensation) */
+        .range-wrap { display: flex; align-items: center; gap: 10px; }
+        .range-wrap input[type="range"] {
+            width: 120px;
+            accent-color: var(--accent);
+        }
+        .range-wrap input[type="range"]:disabled { opacity: 0.4; }
+        .range-value {
+            font-size: 13px;
+            font-weight: 500;
+            color: var(--text-secondary);
+            min-width: 24px;
+            text-align: right;
+        }
         
         /* Text Input */
         .text-input {
@@ -1071,6 +1094,18 @@ class WebServer(
                     <span class="toggle-track"></span>
                 </label>
             </div>
+            <div class="setting-row">
+                <div>
+                    <span class="setting-label">Exposure Compensation</span>
+                    <div class="setting-sublabel">Range and step come from the camera HAL; disabled if the device reports none</div>
+                </div>
+                <div class="range-wrap">
+                    <input type="range" id="exposureSlider" step="1"
+                        oninput="exposureDragging = true; document.getElementById('exposureValue').textContent = this.value"
+                        onchange="setSetting('exposure_compensation', this.value); exposureDragging = false">
+                    <span class="range-value" id="exposureValue">0</span>
+                </div>
+            </div>
         </div>
 
         <!-- Detection -->
@@ -1177,6 +1212,10 @@ class WebServer(
         
         // --- Status polling ---
         let initialLoad = true;
+        // Set while the user is dragging the exposure slider (oninput fires continuously
+        // during a drag), cleared once the drag commits (onchange). Same problem as
+        // authUsername below, applied to a value the user actively drags rather than types.
+        let exposureDragging = false;
         function fetchStatus() {
             fetch('/status')
                 .then(r => r.json())
@@ -1254,6 +1293,17 @@ class WebServer(
                     document.getElementById('toggleFlashlight').checked = data.flashlightEnabled;
                     document.getElementById('toggleNightMode').checked = data.nightModeEnabled;
                     document.getElementById('toggleHdr').checked = data.hdrEnabled;
+                    // min==max (camera not yet initialised, or the HAL genuinely reports
+                    // no adjustable range) means there is nothing the slider can do --
+                    // disable it rather than show a control that silently does nothing.
+                    var exposureSlider = document.getElementById('exposureSlider');
+                    exposureSlider.min = data.exposureCompensationMin;
+                    exposureSlider.max = data.exposureCompensationMax;
+                    exposureSlider.disabled = data.exposureCompensationMin === data.exposureCompensationMax;
+                    // A poll landing mid-drag must not snap the thumb back to the
+                    // not-yet-committed server value.
+                    if (!exposureDragging) exposureSlider.value = data.exposureCompensation;
+                    document.getElementById('exposureValue').textContent = data.exposureCompensation;
                     document.getElementById('toggleDetectionEnabled').checked = data.detectionEnabled;
                     document.getElementById('toggleMotionDetection').checked = data.motionDetectionEnabled;
                     document.getElementById('toggleObjectDetection').checked = data.objectDetectionEnabled;

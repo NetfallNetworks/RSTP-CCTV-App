@@ -186,6 +186,22 @@ object AppPreferences {
         prefs(context).edit().putBoolean(KEY_HDR_ENABLED, enabled).apply()
     }
 
+    // --- Exposure compensation ---
+    private const val KEY_EXPOSURE_COMPENSATION = "exposure_compensation"
+
+    /**
+     * In HAL exposure-compensation steps, not EV -- Camera2Base.setExposure() takes the
+     * same raw value CONTROL_AE_COMPENSATION expects. 0 by default (no adjustment); the
+     * step size and range (this device reports [-4, +4] at 1/2 EV/step) come from
+     * getMinExposure()/getMaxExposure() at apply time, not from a stored constant.
+     */
+    fun getExposureCompensation(context: Context): Int =
+        prefs(context).getInt(KEY_EXPOSURE_COMPENSATION, 0)
+
+    fun setExposureCompensation(context: Context, value: Int) {
+        prefs(context).edit().putInt(KEY_EXPOSURE_COMPENSATION, value).apply()
+    }
+
     // --- Detection ---
     private const val KEY_DETECTION_ENABLED = "detection_enabled"
     private const val KEY_MOTION_DETECTION_ENABLED = "motion_detection_enabled"
