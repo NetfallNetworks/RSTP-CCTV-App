@@ -10,8 +10,8 @@ Runs an RTSP server and a web dashboard on your device, streams to VLC, OBS, Fri
 Home Assistant or any NVR, and records motion events locally — no cloud, no account,
 no subscription.
 
-[![CI](https://github.com/Zektopic/RSTP-CCTV-App/actions/workflows/ci.yml/badge.svg)](https://github.com/Zektopic/RSTP-CCTV-App/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/Zektopic/RSTP-CCTV-App?sort=semver)](https://github.com/Zektopic/RSTP-CCTV-App/releases)
+[![CI](https://github.com/NetfallNetworks/RSTP-CCTV-App/actions/workflows/ci.yml/badge.svg)](https://github.com/NetfallNetworks/RSTP-CCTV-App/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/NetfallNetworks/RSTP-CCTV-App?sort=semver)](https://github.com/NetfallNetworks/RSTP-CCTV-App/releases)
 [![Min SDK](https://img.shields.io/badge/minSdk-24-blue)](https://developer.android.com/about/versions/nougat)
 [![Target SDK](https://img.shields.io/badge/targetSdk-36-blue)](https://developer.android.com/about/versions/16)
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.x-7F52FF?logo=kotlin&logoColor=white)](https://kotlinlang.org)
@@ -426,6 +426,24 @@ block autostart outright regardless of the setting.
 `detect.tflite` is missing or lacks TFLite Metadata — see
 [object detection setup](#object-detection-setup). Motion
 detection is unaffected.
+</details>
+
+<details>
+<summary><b>CI fails with "Could not find com.github.NetfallNetworks..."</b></summary>
+
+`RootEncoder` and `RTSP-Server` are forks pinned by commit SHA in
+`gradle/libs.versions.toml` and resolved from [JitPack](https://jitpack.io), which builds
+each pinned commit on demand the first time it is requested rather than hosting a
+pre-built artifact. This error means JitPack's build of that specific commit failed —
+often a transient issue, such as JitPack itself getting rate-limited while fetching a
+nested dependency — and JitPack **caches that failure** rather than retrying it.
+
+1. Open `https://jitpack.io/com/github/NetfallNetworks/<repo>/<sha>/build.log` (repo is
+   `RootEncoder` or `RTSP-Server`, `<sha>` is the failing pin from
+   `gradle/libs.versions.toml`) to confirm the failure reason.
+2. Someone with access to jitpack.io has to look up that repo and commit there and
+   re-request the build — Gradle will not retry this on its own, and it will not resolve
+   until the rebuild is forced.
 </details>
 
 ---
