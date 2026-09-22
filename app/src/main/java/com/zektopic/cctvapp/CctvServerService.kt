@@ -1781,30 +1781,21 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
      * Applies the HDR scene-mode setting to the running camera, the same way
      * [applyFlashlight] applies the flashlight setting via `enableLantern()`/`disableLantern()`.
      *
-     * Currently a no-op: `Camera2Base.enableHdrSceneMode()`/`disableHdrSceneMode()` were added
-     * in RootEncoder PR #3 (NetfallNetworks/RootEncoder), which is not yet merged, and this
-     * app pins RootEncoder by commit SHA (see gradle/libs.versions.toml) -- so the call cannot
-     * be made without either pointing the pin at an unmerged commit or breaking the build.
+     * Uses `Camera2Base.enableHdrSceneMode()`/`disableHdrSceneMode()`, added in RootEncoder PR
+     * #3 (NetfallNetworks/RootEncoder) and pulled in via the rootEncoder/rtspServer pins in
+     * gradle/libs.versions.toml.
      *
-     * Once RootEncoder#3 merges and both the RTSP-Server and this app's pins are bumped to
-     * include it (see the RootEncoder PR for the required order), this becomes:
-     *
-     * ```
-     * if (!::rtspServerCamera.isInitialized || !rtspServerCamera.isStreaming) return
-     * try {
-     *     if (hdrEnabled) rtspServerCamera.enableHdrSceneMode()
-     *     else rtspServerCamera.disableHdrSceneMode()
-     * } catch (e: Exception) {
-     *     android.util.Log.e("CctvServerService", "Failed to toggle HDR scene mode", e)
-     * }
-     * ```
-     *
-     * The setting itself (preference, `/action/set-setting` key, dashboard toggle, `/status`
-     * field) is fully wired regardless, so flipping it on today safely does nothing, and no
-     * further app-side plumbing is needed once the dependency lands.
+     * Whether this actually affects the RTSP video stream (rather than only stills) is
+     * unproven on real hardware as of this writing.
      */
     private fun applyHdr() {
-        // See kdoc above: intentionally no-op until the RootEncoder pin is bumped.
+        if (!::rtspServerCamera.isInitialized || !rtspServerCamera.isStreaming) return
+        try {
+            if (hdrEnabled) rtspServerCamera.enableHdrSceneMode()
+            else rtspServerCamera.disableHdrSceneMode()
+        } catch (e: Exception) {
+            android.util.Log.e("CctvServerService", "Failed to toggle HDR scene mode", e)
+        }
     }
 
     private val lightSensorListener = object : SensorEventListener {

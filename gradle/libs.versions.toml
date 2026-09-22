@@ -27,18 +27,30 @@ recyclerview = "1.3.2"
 # rootEncoder must equal the SHA rtspServer pins, or Gradle picks between the two
 # arbitrarily. Both forks' PRs are now merged (RootEncoder#2 as 014f1fd on
 # netfall/2.7.2, RTSP-Server#2 as 651f764 on netfall/1.4.1), and neither merge was a
-# fast-forward, so 165122d/00f8046 below are no longer reachable from their branch
-# tips. They stay pinned here anyway, deliberately: RTSP-Server's own build (unchanged
-# by its merge -- 651f764 is tree-identical to 00f8046) hardcodes its RootEncoder
-# dependency at exactly 165122d, so bumping our rootEncoder pin to the new merged head
-# (014f1fd) doesn't match that and silently loses the "must equal" invariant above --
-# `:app:dependencies` shows Gradle overriding our 014f1fd request back down to 165122d
-# transitively. 165122d and 00f8046 remain valid forever regardless of branch
-# reachability (JitPack builds any public commit SHA directly, and GitHub never drops
-# commit history reachable by SHA), and both are tree-identical to their merged heads,
-# so nothing is lost by staying pinned to them.
-rootEncoder = "165122d05c219ceddec466869ab73a2b0038eeff"
-rtspServer = "00f8046f9af9bca2fbbb158cb87cfb48125afeca"
+# fast-forward, so 165122d/00f8046 (the previous pins here) are no longer reachable
+# from their branch tips. They stayed pinned for a while anyway, deliberately:
+# RTSP-Server's own build hardcoded its RootEncoder dependency at exactly 165122d, so
+# bumping our rootEncoder pin without RTSP-Server also moving loses the "must equal"
+# invariant above -- `:app:dependencies` would show Gradle overriding our request back
+# down to 165122d transitively.
+#
+# That invariant is why this second bump had to happen in lockstep too: RootEncoder#3
+# added CONTROL_SCENE_MODE_HDR support (enableHdrSceneMode()/disableHdrSceneMode() on
+# Camera2Base), merged on netfall/2.7.2 as 622284165d6dd17b1861d9f2cdfccf004b91af62.
+# RTSP-Server#3 repointed its own RootEncoder pin at that same SHA, merged on
+# netfall/1.4.1 as 5f724ceaa2f5e370d58c186496602b2c4d8c1281 (its
+# gradle/libs.versions.toml now pins rootEncoderFork to 622284165... too). Both pins
+# below are bumped to match: rootEncoder = the RootEncoder SHA, rtspServer = the
+# RTSP-Server SHA that itself pins that same RootEncoder SHA. Verify with
+# `:app:dependencies` after any future bump here -- don't just assume the two agree.
+rootEncoder = "622284165d6dd17b1861d9f2cdfccf004b91af62"
+# Short SHA, deliberately: JitPack keys builds by the exact version string, so
+# "5f724ceaa2" and "5f724ceaa2f5e370d58c186496602b2c4d8c1281" are different artifacts
+# with separate build records. The full SHA's build failed (429 fetching RootEncoder
+# from JitPack itself) and JitPack caches failures forever; the rebuild landed under
+# the short SHA. Same commit -- the build API reports
+# commit=5f724ceaa2f5e370d58c186496602b2c4d8c1281 for this version.
+rtspServer = "5f724ceaa2"
 nanohttpd = "2.3.1"
 # tensorflow-lite-task-vision was frozen at 0.4.4 (Jul 2023) and its
 # libtask_vision_jni.so has 4 KB LOAD alignment, which fails Android 16 KB
