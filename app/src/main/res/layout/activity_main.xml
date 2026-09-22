@@ -535,6 +535,15 @@
                     android:text="@string/night_mode_toggle"
                     android:textAppearance="@style/TextAppearance.Material3.BodyLarge" />
 
+                <!-- HDR Toggle: off by default, not always desirable (see AppPreferences.getHdrEnabled) -->
+                <com.google.android.material.materialswitch.MaterialSwitch
+                    android:id="@+id/switch_hdr"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:text="@string/hdr_toggle"
+                    android:textAppearance="@style/TextAppearance.Material3.BodyLarge" />
+
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 

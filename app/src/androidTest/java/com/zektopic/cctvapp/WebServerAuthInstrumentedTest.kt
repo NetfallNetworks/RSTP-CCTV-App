@@ -68,6 +68,7 @@ class WebServerAuthInstrumentedTest {
             getTimestampSize = { "Medium" },
             getFlashlightEnabled = { false },
             getNightModeEnabled = { false },
+            getHdrEnabled = { false },
             getForceSoftware = { false },
             getEncoderImplementation = { EncoderImplementation.DEFAULT.storedValue },
             getActiveEncoderImplementation = { EncoderImplementation.DEFAULT.storedValue },
