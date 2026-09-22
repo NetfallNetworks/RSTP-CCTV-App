@@ -1101,8 +1101,8 @@ class WebServer(
                 </div>
                 <div class="range-wrap">
                     <input type="range" id="exposureSlider" step="1"
-                        oninput="document.getElementById('exposureValue').textContent = this.value"
-                        onchange="setSetting('exposure_compensation', this.value)">
+                        oninput="exposureDragging = true; document.getElementById('exposureValue').textContent = this.value"
+                        onchange="setSetting('exposure_compensation', this.value); exposureDragging = false">
                     <span class="range-value" id="exposureValue">0</span>
                 </div>
             </div>
@@ -1212,6 +1212,10 @@ class WebServer(
         
         // --- Status polling ---
         let initialLoad = true;
+        // Set while the user is dragging the exposure slider (oninput fires continuously
+        // during a drag), cleared once the drag commits (onchange). Same problem as
+        // authUsername below, applied to a value the user actively drags rather than types.
+        let exposureDragging = false;
         function fetchStatus() {
             fetch('/status')
                 .then(r => r.json())
@@ -1296,7 +1300,9 @@ class WebServer(
                     exposureSlider.min = data.exposureCompensationMin;
                     exposureSlider.max = data.exposureCompensationMax;
                     exposureSlider.disabled = data.exposureCompensationMin === data.exposureCompensationMax;
-                    exposureSlider.value = data.exposureCompensation;
+                    // A poll landing mid-drag must not snap the thumb back to the
+                    // not-yet-committed server value.
+                    if (!exposureDragging) exposureSlider.value = data.exposureCompensation;
                     document.getElementById('exposureValue').textContent = data.exposureCompensation;
                     document.getElementById('toggleDetectionEnabled').checked = data.detectionEnabled;
                     document.getElementById('toggleMotionDetection').checked = data.motionDetectionEnabled;

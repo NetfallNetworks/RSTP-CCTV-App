@@ -154,6 +154,13 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
     @Volatile private var nightModeEnabled = false
     @Volatile private var hdrEnabled = false
     @Volatile private var exposureCompensation = 0
+    // Cached copy of the HAL's CONTROL_AE_COMPENSATION_RANGE, populated on the main thread by
+    // applyExposureCompensation() once the camera is actually streaming. 0/0 means "not yet
+    // known" -- the settings clamp and the /status getters below both need these bounds but
+    // must never call into rtspServerCamera themselves (one runs on the HTTP thread, the other
+    // on every dashboard poll), so they read these fields instead.
+    @Volatile private var exposureCompensationMin = 0
+    @Volatile private var exposureCompensationMax = 0
     @Volatile private var detectionEnabled = false
     @Volatile private var motionDetectionEnabled = true
     @Volatile private var objectDetectionEnabled = true
@@ -641,14 +648,17 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                         // throwing -- consistent with motion_sensitivity/detection_cooldown
                         // above, which also parse before touching state.
                         value.toIntOrNull()?.let { requested ->
-                            // Clamp against the HAL's real range only when it is known
-                            // (camera initialised); otherwise store as given and let
-                            // applyExposureCompensation()/setExposure() clamp on apply.
-                            exposureCompensation = if (::rtspServerCamera.isInitialized) {
-                                requested.coerceIn(
-                                    rtspServerCamera.getMinExposure(),
-                                    rtspServerCamera.getMaxExposure()
-                                )
+                            // Clamp against the cached HAL range only once it is genuinely
+                            // known (max > min). Gating on rtspServerCamera.isInitialized was
+                            // wrong: that only means the lateinit object was constructed, not
+                            // that the camera has opened and negotiated its real range -- in
+                            // that window getMin/MaxExposure() both return 0, so a requested
+                            // +3 would silently coerce to 0 and get persisted as if it were
+                            // the user's actual value. Falling through to the requested value
+                            // here instead leaves it for applyExposureCompensation()/
+                            // setExposure() to clamp once the HAL range is known.
+                            exposureCompensation = if (exposureCompensationMax > exposureCompensationMin) {
+                                requested.coerceIn(exposureCompensationMin, exposureCompensationMax)
                             } else {
                                 requested
                             }
@@ -785,10 +795,12 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             getNightModeEnabled = { nightModeEnabled },
             getHdrEnabled = { hdrEnabled },
             getExposureCompensation = { exposureCompensation },
-            // 0/0 when the camera isn't initialised yet -- the UI disables the control
-            // on min==max rather than showing a range it cannot actually apply.
-            getExposureCompensationMin = { if (::rtspServerCamera.isInitialized) rtspServerCamera.getMinExposure() else 0 },
-            getExposureCompensationMax = { if (::rtspServerCamera.isInitialized) rtspServerCamera.getMaxExposure() else 0 },
+            // 0/0 until applyExposureCompensation() has cached the HAL's real range -- the UI
+            // disables the control on min==max rather than showing a range it cannot actually
+            // apply. Reads the cached fields rather than the camera library: this getter runs
+            // on every dashboard poll, from the HTTP thread.
+            getExposureCompensationMin = { exposureCompensationMin },
+            getExposureCompensationMax = { exposureCompensationMax },
             getForceSoftware = { encoderImplementation == EncoderImplementation.SOFTWARE },
             getEncoderImplementation = { encoderImplementation.storedValue },
             getActiveEncoderImplementation = { activeEncoderImplementation.storedValue },
@@ -977,6 +989,16 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             rtspServerCamera.stopStream()
             streamHealth.markStopped()
             startStream()
+            // Same delay onStartCommand uses after its startStream() call -- the capture
+            // session needs a moment to come back up before these can reach a camera that's
+            // actually streaming again (both are no-ops until isStreaming is true). Without
+            // this, restarting for bitrate/fps/keyframe/codec/audio silently reverts HDR and
+            // exposure to the HAL default while the stored preferences still read the old
+            // values -- a divergence between what the UI shows and what the camera is doing.
+            Handler(Looper.getMainLooper()).postDelayed({
+                applyHdr()
+                applyExposureCompensation()
+            }, 1000)
         }
     }
 
@@ -1843,6 +1865,11 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
         if (!::rtspServerCamera.isInitialized || !rtspServerCamera.isStreaming) return
         try {
             rtspServerCamera.setExposure(exposureCompensation)
+            // This is the only place the HAL's real range is safe to read -- main thread,
+            // camera confirmed streaming -- so cache it here for the settings clamp and the
+            // /status getters, neither of which may call into rtspServerCamera themselves.
+            exposureCompensationMin = rtspServerCamera.getMinExposure()
+            exposureCompensationMax = rtspServerCamera.getMaxExposure()
             android.util.Log.i(
                 "CctvServerService",
                 "Exposure compensation requested=$exposureCompensation applied=${rtspServerCamera.getExposure()}"
