@@ -34,6 +34,16 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
+      # RootEncoder and RTSP-Server are forks pinned by commit SHA in
+      # gradle/libs.versions.toml and resolved from JitPack, which builds each pinned
+      # commit on demand rather than hosting a pre-built artifact. The first step that
+      # touches the dependency graph -- this one -- is where a broken pin surfaces:
+      # if it fails with "Could not find com.github.NetfallNetworks...", JitPack's
+      # build of that commit failed (see its own build log at
+      # https://jitpack.io/com/github/NetfallNetworks/<repo>/<sha>/build.log) and it is
+      # NOT retried automatically. Someone with jitpack.io access has to open that page
+      # and re-request the build. See README Troubleshooting: "CI fails with 'Could not
+      # find com.github.NetfallNetworks...'".
       - name: Unit tests
         run: ./gradlew testDebugUnitTest --stacktrace
 
