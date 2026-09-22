@@ -153,6 +153,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
     @Volatile private var flashlightEnabled = false
     @Volatile private var nightModeEnabled = false
     @Volatile private var hdrEnabled = false
+    @Volatile private var exposureCompensation = 0
     @Volatile private var detectionEnabled = false
     @Volatile private var motionDetectionEnabled = true
     @Volatile private var objectDetectionEnabled = true
@@ -478,6 +479,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
         flashlightEnabled = AppPreferences.getFlashlightEnabled(this)
         nightModeEnabled = AppPreferences.getNightModeEnabled(this)
         hdrEnabled = AppPreferences.getHdrEnabled(this)
+        exposureCompensation = AppPreferences.getExposureCompensation(this)
         detectionEnabled = AppPreferences.getDetectionEnabled(this)
         motionDetectionEnabled = AppPreferences.getMotionDetectionEnabled(this)
         objectDetectionEnabled = AppPreferences.getObjectDetectionEnabled(this)
@@ -634,6 +636,26 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                         AppPreferences.setHdrEnabled(this, hdrEnabled)
                         onMain { applyHdr() }
                     }
+                    "exposure_compensation" -> {
+                        // An unparseable value leaves the setting alone rather than
+                        // throwing -- consistent with motion_sensitivity/detection_cooldown
+                        // above, which also parse before touching state.
+                        value.toIntOrNull()?.let { requested ->
+                            // Clamp against the HAL's real range only when it is known
+                            // (camera initialised); otherwise store as given and let
+                            // applyExposureCompensation()/setExposure() clamp on apply.
+                            exposureCompensation = if (::rtspServerCamera.isInitialized) {
+                                requested.coerceIn(
+                                    rtspServerCamera.getMinExposure(),
+                                    rtspServerCamera.getMaxExposure()
+                                )
+                            } else {
+                                requested
+                            }
+                            AppPreferences.setExposureCompensation(this, exposureCompensation)
+                            onMain { applyExposureCompensation() }
+                        }
+                    }
                     // Legacy key. Still accepted because NVR setups and scripts built
                     // against the old dashboard send it, and silently ignoring it would
                     // break them with no error to go on.
@@ -762,6 +784,11 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             getFlashlightEnabled = { flashlightEnabled },
             getNightModeEnabled = { nightModeEnabled },
             getHdrEnabled = { hdrEnabled },
+            getExposureCompensation = { exposureCompensation },
+            // 0/0 when the camera isn't initialised yet -- the UI disables the control
+            // on min==max rather than showing a range it cannot actually apply.
+            getExposureCompensationMin = { if (::rtspServerCamera.isInitialized) rtspServerCamera.getMinExposure() else 0 },
+            getExposureCompensationMax = { if (::rtspServerCamera.isInitialized) rtspServerCamera.getMaxExposure() else 0 },
             getForceSoftware = { encoderImplementation == EncoderImplementation.SOFTWARE },
             getEncoderImplementation = { encoderImplementation.storedValue },
             getActiveEncoderImplementation = { activeEncoderImplementation.storedValue },
@@ -1397,9 +1424,13 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
         val newFlashlightEnabled = intent?.getBooleanExtra("flashlight_enabled", AppPreferences.getFlashlightEnabled(this)) ?: false
         val newNightModeEnabled = intent?.getBooleanExtra("night_mode_enabled", AppPreferences.getNightModeEnabled(this)) ?: false
         val newHdrEnabled = intent?.getBooleanExtra("hdr_enabled", AppPreferences.getHdrEnabled(this)) ?: false
+        // No dedicated Intent extra: unlike HDR/flashlight/night-mode there is no
+        // ACTION_TOGGLE_EXPOSURE, so the stored preference is the only source here.
+        val newExposureCompensation = AppPreferences.getExposureCompensation(this)
         flashlightEnabled = newFlashlightEnabled
         nightModeEnabled = newNightModeEnabled
         hdrEnabled = newHdrEnabled
+        exposureCompensation = newExposureCompensation
         AppPreferences.setFlashlightEnabled(this, flashlightEnabled)
         AppPreferences.setNightModeEnabled(this, nightModeEnabled)
         AppPreferences.setHdrEnabled(this, hdrEnabled)
@@ -1417,6 +1448,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             applyFlashlight()
             updateNightModeSensor()
             applyHdr()
+            applyExposureCompensation()
         }, 1000)
 
         return START_STICKY
@@ -1795,6 +1827,28 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             else rtspServerCamera.disableHdrSceneMode()
         } catch (e: Exception) {
             android.util.Log.e("CctvServerService", "Failed to toggle HDR scene mode", e)
+        }
+    }
+
+    /**
+     * Applies exposure compensation to the running camera via `Camera2Base.setExposure()`,
+     * the same way [applyHdr] applies the HDR scene mode.
+     *
+     * setExposure() clamps internally to the HAL's CONTROL_AE_COMPENSATION_RANGE, so the
+     * requested value is passed through as-is here rather than re-clamped -- this is also
+     * why the value and what getExposure() reports back are both logged: it is the only
+     * way to see on real hardware whether the requested value survived the HAL's clamp.
+     */
+    private fun applyExposureCompensation() {
+        if (!::rtspServerCamera.isInitialized || !rtspServerCamera.isStreaming) return
+        try {
+            rtspServerCamera.setExposure(exposureCompensation)
+            android.util.Log.i(
+                "CctvServerService",
+                "Exposure compensation requested=$exposureCompensation applied=${rtspServerCamera.getExposure()}"
+            )
+        } catch (e: Exception) {
+            android.util.Log.e("CctvServerService", "Failed to apply exposure compensation", e)
         }
     }
 
