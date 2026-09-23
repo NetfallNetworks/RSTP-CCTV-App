@@ -161,6 +161,11 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
     // on every dashboard poll), so they read these fields instead.
     @Volatile private var exposureCompensationMin = 0
     @Volatile private var exposureCompensationMax = 0
+    // Cached copy of CONTROL_AE_COMPENSATION_STEP (a Rational, e.g. 1/2), converted to a
+    // Double so clients can render EV as value*step. 0.0 means "not yet known" -- same
+    // convention as min/max above -- and is also what a zero-denominator Rational collapses
+    // to, since that can never be a valid step.
+    @Volatile private var exposureCompensationStep = 0.0
     @Volatile private var detectionEnabled = false
     @Volatile private var motionDetectionEnabled = true
     @Volatile private var objectDetectionEnabled = true
@@ -801,6 +806,8 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             // on every dashboard poll, from the HTTP thread.
             getExposureCompensationMin = { exposureCompensationMin },
             getExposureCompensationMax = { exposureCompensationMax },
+            // 0.0 alongside min==max==0 above -- clients treat step<=0 as "unknown".
+            getExposureCompensationStep = { exposureCompensationStep },
             getForceSoftware = { encoderImplementation == EncoderImplementation.SOFTWARE },
             getEncoderImplementation = { encoderImplementation.storedValue },
             getActiveEncoderImplementation = { activeEncoderImplementation.storedValue },
@@ -1870,6 +1877,17 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             // /status getters, neither of which may call into rtspServerCamera themselves.
             exposureCompensationMin = rtspServerCamera.getMinExposure()
             exposureCompensationMax = rtspServerCamera.getMaxExposure()
+            // RootEncoder has no getter for CONTROL_AE_COMPENSATION_STEP itself, but
+            // Camera2Base.getCameraCharacteristics() already resolves to the characteristics
+            // of whichever camera id is actually open (including after switchCamera()), so
+            // read the step straight from there instead of re-deriving a camera id ourselves.
+            val compensationStep = rtspServerCamera.getCameraCharacteristics()
+                ?.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)
+            exposureCompensationStep = if (compensationStep != null && compensationStep.denominator != 0) {
+                compensationStep.numerator.toDouble() / compensationStep.denominator.toDouble()
+            } else {
+                0.0
+            }
             android.util.Log.i(
                 "CctvServerService",
                 "Exposure compensation requested=$exposureCompensation applied=${rtspServerCamera.getExposure()}"

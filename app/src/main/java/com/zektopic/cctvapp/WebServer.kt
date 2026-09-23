@@ -41,6 +41,8 @@ class WebServer(
     /** From Camera2Base.getMinExposure()/getMaxExposure(); both 0 until the camera inits. */
     private val getExposureCompensationMin: () -> Int,
     private val getExposureCompensationMax: () -> Int,
+    /** CONTROL_AE_COMPENSATION_STEP as a Double (e.g. 0.5); 0.0 means unknown/uninitialised. */
+    private val getExposureCompensationStep: () -> Double,
     /** Retained for dashboards and NVR scripts written against the old boolean. */
     private val getForceSoftware: () -> Boolean,
     private val getEncoderImplementation: () -> String,
@@ -310,6 +312,7 @@ class WebServer(
                 "exposureCompensation":${getExposureCompensation()},
                 "exposureCompensationMin":${getExposureCompensationMin()},
                 "exposureCompensationMax":${getExposureCompensationMax()},
+                "exposureCompensationStep":${exposureCompensationStepJson()},
                 "forceSoftware":${getForceSoftware()},
                 "encoderImplementation":"${getEncoderImplementation()}",
                 "activeEncoderImplementation":"${getActiveEncoderImplementation()}",
@@ -396,6 +399,17 @@ class WebServer(
         newFixedLengthResponse(status, "application/json", body)
 
     private fun escapeJson(s: String): String = s.replace("\\", "\\\\").replace("\"", "\\\"")
+
+    /**
+     * exposureCompensationStep as a JSON-safe number literal. A Rational with a zero
+     * denominator (or any other way NaN/Infinity could sneak in) must never reach the
+     * response -- that is not valid JSON -- so anything non-finite collapses to 0, the
+     * same "unknown" value used before the camera has initialised.
+     */
+    private fun exposureCompensationStepJson(): String {
+        val step = getExposureCompensationStep()
+        return if (step.isFinite()) step.toString() else "0"
+    }
 
     private fun buildRtspUrl(): String {
         val authOn = getAuthEnabled()
@@ -1303,7 +1317,13 @@ class WebServer(
                     // A poll landing mid-drag must not snap the thumb back to the
                     // not-yet-committed server value.
                     if (!exposureDragging) exposureSlider.value = data.exposureCompensation;
-                    document.getElementById('exposureValue').textContent = data.exposureCompensation;
+                    // step<=0 means the HAL's step is not known yet (or the camera hasn't
+                    // initialised) -- fall back to the raw step count rather than a fake EV.
+                    document.getElementById('exposureValue').textContent =
+                        data.exposureCompensationStep > 0
+                            ? (data.exposureCompensation * data.exposureCompensationStep >= 0 ? '+' : '') +
+                              (data.exposureCompensation * data.exposureCompensationStep).toFixed(1) + ' EV'
+                            : data.exposureCompensation;
                     document.getElementById('toggleDetectionEnabled').checked = data.detectionEnabled;
                     document.getElementById('toggleMotionDetection').checked = data.motionDetectionEnabled;
                     document.getElementById('toggleObjectDetection').checked = data.objectDetectionEnabled;
