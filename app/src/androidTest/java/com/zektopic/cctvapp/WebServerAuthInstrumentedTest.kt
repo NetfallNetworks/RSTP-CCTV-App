@@ -72,6 +72,7 @@ class WebServerAuthInstrumentedTest {
             getExposureCompensation = { 0 },
             getExposureCompensationMin = { 0 },
             getExposureCompensationMax = { 0 },
+            getExposureCompensationStep = { 0.0 },
             getForceSoftware = { false },
             getEncoderImplementation = { EncoderImplementation.DEFAULT.storedValue },
             getActiveEncoderImplementation = { EncoderImplementation.DEFAULT.storedValue },
