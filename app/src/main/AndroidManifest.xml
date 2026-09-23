@@ -60,6 +60,11 @@
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <!-- Delivered only to this app itself, right after "adb install r" (or a
+                     Play/managed-config update) replaces the APK; see BootReceiver's class
+                     doc. It is on Android's implicit-broadcast exemption list, so this
+                     manifest-registered receiver still gets it with no extra permission. -->
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
 
