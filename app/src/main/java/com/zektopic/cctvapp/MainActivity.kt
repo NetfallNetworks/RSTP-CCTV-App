@@ -112,7 +112,10 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * Starts the camera server on behalf of [BootReceiver]'s [BootReceiver.ACTION_START_SERVER_FROM_BOOT]
-     * launch. Deliberately separate from [autoStartServerIfNeeded]: that one is gated on
+     * launch, whether that receiver was itself woken by a reboot or by this app having
+     * just been updated in place -- see [BootReceiver.isRestartTriggerAction]; both
+     * reach this same code path with no distinction made here. Deliberately separate
+     * from [autoStartServerIfNeeded]: that one is gated on
      * the "auto start on launch" preference, a different opt-in from "start on boot"
      * (the Enable Server switch's own persisted position, see [BootStartPolicy]) --
      * conflating them would mean boot-start silently stops working for anyone who has
