@@ -1322,25 +1322,50 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             return START_STICKY
         }
 
-        val newVideoCodec = intent?.getStringExtra("video_codec") ?: AppPreferences.getVideoCodec(this)
-        val newShowPreview = intent?.getBooleanExtra("show_preview", AppPreferences.getShowPreview(this)) ?: false
-        val newWidth = intent?.getIntExtra("width", AppPreferences.getVideoWidth(this)) ?: 640
-        val newHeight = intent?.getIntExtra("height", AppPreferences.getVideoHeight(this)) ?: 480
+        // A null Intent is how the system restarts a START_STICKY service after killing the
+        // process (e.g. lmkd). Every setting must then come from the stored preferences;
+        // the values below are persisted back, so a hardcoded default would overwrite them.
+        val startSettings = StartSettings.resolve(
+            intent?.let { IntentStartExtras(it) },
+            StartSettings(
+                videoCodec = AppPreferences.getVideoCodec(this),
+                showPreview = AppPreferences.getShowPreview(this),
+                width = AppPreferences.getVideoWidth(this),
+                height = AppPreferences.getVideoHeight(this),
+                authEnabled = AppPreferences.getAuthEnabled(this),
+                authUsername = AppPreferences.getUsername(this),
+                authPassword = AppPreferences.getPassword(this),
+                showTimestamp = AppPreferences.getShowTimestamp(this),
+                showDate = AppPreferences.getShowDate(this),
+                timestampPosition = AppPreferences.getTimestampPosition(this),
+                timestampSize = AppPreferences.getTimestampSize(this),
+                detectionEnabled = AppPreferences.getDetectionEnabled(this),
+                motionDetectionEnabled = AppPreferences.getMotionDetectionEnabled(this),
+                objectDetectionEnabled = AppPreferences.getObjectDetectionEnabled(this),
+                audioEnabled = AppPreferences.getAudioEnabled(this),
+                flashlightEnabled = AppPreferences.getFlashlightEnabled(this),
+                nightModeEnabled = AppPreferences.getNightModeEnabled(this),
+                hdrEnabled = AppPreferences.getHdrEnabled(this),
+            )
+        )
+        val newVideoCodec = startSettings.videoCodec
+        val newShowPreview = startSettings.showPreview
+        val newWidth = startSettings.width
+        val newHeight = startSettings.height
         // Read from preferences, not the Intent: the app persists the choice before
         // asking for a restart, and the four-way setting no longer fits a boolean extra.
         val newEncoderImplementation = AppPreferences.getEncoderImplementation(this)
-        val newAuthEnabled = intent?.getBooleanExtra("auth_enabled", AppPreferences.getAuthEnabled(this)) ?: false
-        val newAuthUsername = intent?.getStringExtra("auth_username") ?: AppPreferences.getUsername(this)
-        val newAuthPassword = intent?.getStringExtra("auth_password") ?: AppPreferences.getPassword(this)
-        val newShowTimestamp = intent?.getBooleanExtra("show_timestamp", AppPreferences.getShowTimestamp(this)) ?: false
-        val newShowDate = intent?.getBooleanExtra("show_date", AppPreferences.getShowDate(this)) ?: false
-        val newTimestampPosition = intent?.getStringExtra("timestamp_position") ?: AppPreferences.getTimestampPosition(this)
-        val newTimestampSize = intent?.getStringExtra("timestamp_size") ?: AppPreferences.getTimestampSize(this)
-        val newDetectionEnabled = intent?.getBooleanExtra("detection_enabled", AppPreferences.getDetectionEnabled(this)) ?: false
-        val newMotionDetectionEnabled = intent?.getBooleanExtra("motion_detection_enabled", AppPreferences.getMotionDetectionEnabled(this)) ?: true
-        val newObjectDetectionEnabled = intent?.getBooleanExtra("object_detection_enabled", AppPreferences.getObjectDetectionEnabled(this)) ?: true
-        val newAudioEnabled = intent?.getBooleanExtra("audio_enabled", AppPreferences.getAudioEnabled(this))
-            ?: AppPreferences.getAudioEnabled(this)
+        val newAuthEnabled = startSettings.authEnabled
+        val newAuthUsername = startSettings.authUsername
+        val newAuthPassword = startSettings.authPassword
+        val newShowTimestamp = startSettings.showTimestamp
+        val newShowDate = startSettings.showDate
+        val newTimestampPosition = startSettings.timestampPosition
+        val newTimestampSize = startSettings.timestampSize
+        val newDetectionEnabled = startSettings.detectionEnabled
+        val newMotionDetectionEnabled = startSettings.motionDetectionEnabled
+        val newObjectDetectionEnabled = startSettings.objectDetectionEnabled
+        val newAudioEnabled = startSettings.audioEnabled
         // Compared against the old value below (encoderChanged) before being overwritten,
         // the same way videoCodec/newVideoCodec etc. are -- otherwise a change arriving
         // through this Intent path (rather than the "audio_enabled" /action/set-setting
@@ -1450,9 +1475,9 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
         AppPreferences.setObjectDetectionEnabled(this, objectDetectionEnabled)
 
         // Update flashlight & night mode settings
-        val newFlashlightEnabled = intent?.getBooleanExtra("flashlight_enabled", AppPreferences.getFlashlightEnabled(this)) ?: false
-        val newNightModeEnabled = intent?.getBooleanExtra("night_mode_enabled", AppPreferences.getNightModeEnabled(this)) ?: false
-        val newHdrEnabled = intent?.getBooleanExtra("hdr_enabled", AppPreferences.getHdrEnabled(this)) ?: false
+        val newFlashlightEnabled = startSettings.flashlightEnabled
+        val newNightModeEnabled = startSettings.nightModeEnabled
+        val newHdrEnabled = startSettings.hdrEnabled
         // No dedicated Intent extra: unlike HDR/flashlight/night-mode there is no
         // ACTION_TOGGLE_EXPOSURE, so the stored preference is the only source here.
         val newExposureCompensation = AppPreferences.getExposureCompensation(this)
