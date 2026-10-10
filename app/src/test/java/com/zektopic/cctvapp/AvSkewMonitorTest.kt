@@ -82,7 +82,7 @@ class AvSkewMonitorTest {
         val m = AvSkewMonitor()
         assertEquals(
             "{\"windowSec\":60,\"audio\":{\"n\":0,\"arrivalMinusPtsMeanMs\":null,\"minMs\":null,\"maxMs\":null,\"ptsRate\":null}," +
-                "\"video\":{\"n\":0,\"arrivalMinusPtsMeanMs\":null,\"minMs\":null,\"maxMs\":null,\"ptsRate\":null},\"skewMs\":null}",
+                "\"video\":{\"n\":0,\"arrivalMinusPtsMeanMs\":null,\"minMs\":null,\"maxMs\":null,\"ptsRate\":null},\"skewMs\":null,\"sessions\":[]}",
             m.snapshot().toJson()
         )
         m.onVideo(0, 500_000); m.onVideo(1_000_000, 1_500_000)
@@ -91,5 +91,68 @@ class AvSkewMonitorTest {
         assertTrue(j, j.contains("\"skewMs\":-500.0"))
         assertTrue(j, j.contains("\"ptsRate\":1.0000"))
         assertNotNull(m.snapshot().toLogLine())
+    }
+
+    @Test fun samplesBeforeAnyStartBelongToNoSession() {
+        val m = AvSkewMonitor()
+        assertNull(m.onVideo(0, 100)); assertNull(m.onAudio(0, 100))
+        assertTrue(m.snapshot().sessions.isEmpty())
+    }
+
+    @Test fun firstVideoThenAudioRecordedOnceAndCompletionReported() {
+        val m = AvSkewMonitor()
+        m.onStreamStart(1_000_000, 777)
+        assertNull(m.onVideo(50_000, 1_400_000))
+        assertNull(m.onVideo(83_000, 1_500_000)) // later frames do not overwrite
+        val done = m.onAudio(0, 1_100_000)
+        assertNotNull(done)
+        assertNull(m.onAudio(21_000, 1_200_000))
+        val s = m.snapshot().sessions.single()
+        assertEquals(1, s.seq); assertEquals(777L, s.wallStartMs)
+        assertEquals(400L, s.firstVideoMs); assertEquals(100L, s.firstAudioMs)
+        assertEquals(50_000L, s.firstVideoPtsUs); assertEquals(0L, s.firstAudioPtsUs)
+        assertEquals(s, done)
+    }
+
+    @Test fun audioBeforeVideoCompletesOnVideo() {
+        val m = AvSkewMonitor()
+        m.onStreamStart(0, 1)
+        assertNull(m.onAudio(0, 30_000))
+        assertNull(m.snapshot().sessions.single().firstVideoMs)
+        assertNotNull(m.onVideo(0, 250_000))
+        val s = m.snapshot().sessions.single()
+        assertEquals(30L, s.firstAudioMs); assertEquals(250L, s.firstVideoMs)
+    }
+
+    @Test fun restartOpensNewSessionAndKeepsOldOne() {
+        val m = AvSkewMonitor()
+        m.onStreamStart(0, 10)
+        m.onVideo(0, 200_000)
+        m.onStreamStart(5_000_000, 20) // restart before audio ever arrived
+        m.onVideo(0, 5_300_000); m.onAudio(0, 5_050_000)
+        val ss = m.snapshot().sessions
+        assertEquals(2, ss.size)
+        assertEquals(200L, ss[0].firstVideoMs); assertNull(ss[0].firstAudioMs)
+        assertEquals(300L, ss[1].firstVideoMs); assertEquals(50L, ss[1].firstAudioMs)
+        assertEquals(listOf(1, 2), ss.map { it.seq })
+    }
+
+    @Test fun sessionRingKeepsLastEightNewestLast() {
+        val m = AvSkewMonitor()
+        for (i in 1..11) m.onStreamStart(i * 1000L, i.toLong())
+        val ss = m.snapshot().sessions
+        assertEquals(8, ss.size)
+        assertEquals((4..11).toList(), ss.map { it.seq })
+    }
+
+    @Test fun sessionsJsonShape() {
+        val m = AvSkewMonitor()
+        m.onStreamStart(0, 42)
+        m.onVideo(9, 120_000)
+        val j = m.snapshot().toJson()
+        assertTrue(j, j.contains(
+            "\"sessions\":[{\"seq\":1,\"wallStartMs\":42,\"firstVideoMs\":120,\"firstAudioMs\":null," +
+                "\"firstVideoPtsUs\":9,\"firstAudioPtsUs\":null}]}"
+        ))
     }
 }

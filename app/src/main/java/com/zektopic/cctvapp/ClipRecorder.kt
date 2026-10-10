@@ -367,7 +367,7 @@ class ClipRecorder(
         val data = ByteArray(source.remaining())
         source.get(data)
         val frame = PreRollBuffer.Frame(data, videoInfo.presentationTimeUs, isKeyFrame(data, videoInfo))
-        avSkew.onVideo(videoInfo.presentationTimeUs, arrivalUs)
+        avSkew.onVideo(videoInfo.presentationTimeUs, arrivalUs)?.let { Log.i("AvSkew", "AvSkew session ${it.toLogLine()}") }
         logAvSkewIfDue(arrivalUs)
 
         synchronized(lock) {
@@ -396,7 +396,7 @@ class ClipRecorder(
         val data = ByteArray(source.remaining())
         source.get(data)
         val frame = AudioPreRollBuffer.Frame(data, audioInfo.presentationTimeUs)
-        avSkew.onAudio(audioInfo.presentationTimeUs, arrivalUs)
+        avSkew.onAudio(audioInfo.presentationTimeUs, arrivalUs)?.let { Log.i("AvSkew", "AvSkew session ${it.toLogLine()}") }
 
         synchronized(lock) {
             audioPreRoll.add(frame)

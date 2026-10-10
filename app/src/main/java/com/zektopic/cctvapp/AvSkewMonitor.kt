@@ -13,17 +13,45 @@ data class StreamSkew(
     val ptsRate: Double?
 )
 
+/**
+ * One stream start (a call to startStream()) and when its first video / audio frame reached
+ * the recorder callbacks. Delays are ms after the start; null until that frame is seen.
+ */
+data class AvSession(
+    val seq: Int,
+    val wallStartMs: Long,
+    val firstVideoMs: Long?,
+    val firstAudioMs: Long?,
+    val firstVideoPtsUs: Long?,
+    val firstAudioPtsUs: Long?
+) {
+    val complete: Boolean get() = firstVideoMs != null && firstAudioMs != null
+
+    fun toJson(): String =
+        "{\"seq\":$seq,\"wallStartMs\":$wallStartMs,\"firstVideoMs\":${n(firstVideoMs)}," +
+            "\"firstAudioMs\":${n(firstAudioMs)},\"firstVideoPtsUs\":${n(firstVideoPtsUs)}," +
+            "\"firstAudioPtsUs\":${n(firstAudioPtsUs)}}"
+
+    fun toLogLine(): String =
+        "seq=$seq wallStartMs=$wallStartMs firstVideoMs=${n(firstVideoMs)} firstAudioMs=${n(firstAudioMs)} " +
+            "firstVideoPtsUs=${n(firstVideoPtsUs)} firstAudioPtsUs=${n(firstAudioPtsUs)}"
+
+    private fun n(v: Long?) = v?.toString() ?: "null"
+}
+
 data class AvSkewSnapshot(
     val windowSec: Int,
     val audio: StreamSkew,
     val video: StreamSkew,
     /** audio mean minus video mean of (arrival - pts), ms; null until both streams have samples. */
-    val skewMs: Double?
+    val skewMs: Double?,
+    /** Last stream starts, oldest first (newest last). */
+    val sessions: List<AvSession> = emptyList()
 ) {
     /** The /status `avSkew` object. Hand-built so it needs no Android JSON class. */
     fun toJson(): String =
         "{\"windowSec\":$windowSec,\"audio\":${streamJson(audio)},\"video\":${streamJson(video)}," +
-            "\"skewMs\":${num(skewMs)}}"
+            "\"skewMs\":${num(skewMs)},\"sessions\":[${sessions.joinToString(",") { it.toJson() }}]}"
 
     /** One-line form for the periodic log. */
     fun toLogLine(): String =
@@ -61,6 +89,7 @@ class AvSkewMonitor(
     companion object {
         const val DEFAULT_WINDOW_US = 60_000_000L
         const val DEFAULT_CAPACITY = 8192
+        const val MAX_SESSIONS = 8
     }
 
     private class Ring(val capacity: Int) {
@@ -115,15 +144,47 @@ class AvSkewMonitor(
     private val video = Ring(capacity)
     private val audio = Ring(capacity)
 
-    fun onVideo(ptsUs: Long, arrivalUs: Long) = synchronized(lock) { video.add(ptsUs, arrivalUs, windowUs) }
+    private var nextSeq = 1
+    private var startUs = 0L
+    /** Oldest first; the last entry is the open session. Bounded by [MAX_SESSIONS]. */
+    private val sessions = ArrayList<AvSession>(MAX_SESSIONS)
 
-    fun onAudio(ptsUs: Long, arrivalUs: Long) = synchronized(lock) { audio.add(ptsUs, arrivalUs, windowUs) }
+    /**
+     * Call immediately before each startStream(), on the same clock as arrivalUs. Opens a new
+     * session; earlier ones are kept (last [MAX_SESSIONS]). Callbacks before any start belong
+     * to no session.
+     */
+    fun onStreamStart(startUs: Long, wallMs: Long) = synchronized(lock) {
+        this.startUs = startUs
+        if (sessions.size == MAX_SESSIONS) sessions.removeAt(0)
+        sessions.add(AvSession(nextSeq++, wallMs, null, null, null, null))
+    }
+
+    /** Returns the session if this call completed it (first video and audio both seen), else null. */
+    fun onVideo(ptsUs: Long, arrivalUs: Long): AvSession? = synchronized(lock) {
+        video.add(ptsUs, arrivalUs, windowUs)
+        val i = sessions.lastIndex
+        if (i < 0 || sessions[i].firstVideoMs != null) return@synchronized null
+        val s = sessions[i].copy(firstVideoMs = (arrivalUs - startUs) / 1000, firstVideoPtsUs = ptsUs)
+        sessions[i] = s
+        if (s.complete) s else null
+    }
+
+    /** See [onVideo]. */
+    fun onAudio(ptsUs: Long, arrivalUs: Long): AvSession? = synchronized(lock) {
+        audio.add(ptsUs, arrivalUs, windowUs)
+        val i = sessions.lastIndex
+        if (i < 0 || sessions[i].firstAudioMs != null) return@synchronized null
+        val s = sessions[i].copy(firstAudioMs = (arrivalUs - startUs) / 1000, firstAudioPtsUs = ptsUs)
+        sessions[i] = s
+        if (s.complete) s else null
+    }
 
     fun snapshot(): AvSkewSnapshot = synchronized(lock) {
         val a = audio.toSkew()
         val v = video.toSkew()
         val am = a.arrivalMinusPtsMeanMs
         val vm = v.arrivalMinusPtsMeanMs
-        AvSkewSnapshot((windowUs / 1_000_000L).toInt(), a, v, if (am != null && vm != null) am - vm else null)
+        AvSkewSnapshot((windowUs / 1_000_000L).toInt(), a, v, if (am != null && vm != null) am - vm else null, sessions.toList())
     }
 }
