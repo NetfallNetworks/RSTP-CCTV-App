@@ -58,11 +58,14 @@ class ClipRecorder(
      * after all. Called from inside [lock]; must not call back into this ClipRecorder.
      * Default keeps other call sites (tests) compiling.
      */
-    private val onClipFailed: (eventId: String) -> Unit = {}
+    private val onClipFailed: (eventId: String) -> Unit = {},
+    /** Diagnostic only (see [AvSkewMonitor]); never influences timestamps or recording. */
+    val avSkew: AvSkewMonitor = AvSkewMonitor()
 ) : RecordController {
 
     companion object {
         private const val TAG = "ClipRecorder"
+        private const val AV_SKEW_LOG_INTERVAL_US = 30_000_000L
         const val DEFAULT_PRE_ROLL_US = 5_000_000L
 
         /**
@@ -357,12 +360,15 @@ class ClipRecorder(
     }
 
     override fun recordVideo(videoBuffer: ByteBuffer, videoInfo: MediaCodec.BufferInfo) {
+        val arrivalUs = System.nanoTime() / 1000
         if (videoInfo.size <= 0 || videoInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) return
         // Same read as RootEncoder's own muxer controller: the whole buffer, from zero.
         val source = videoBuffer.duplicate().apply { rewind() }
         val data = ByteArray(source.remaining())
         source.get(data)
         val frame = PreRollBuffer.Frame(data, videoInfo.presentationTimeUs, isKeyFrame(data, videoInfo))
+        avSkew.onVideo(videoInfo.presentationTimeUs, arrivalUs)?.let { Log.i("AvSkew", "AvSkew session ${it.toLogLine()}") }
+        logAvSkewIfDue(arrivalUs)
 
         synchronized(lock) {
             buffer.add(frame)
@@ -384,11 +390,13 @@ class ClipRecorder(
     }
 
     override fun recordAudio(audioBuffer: ByteBuffer, audioInfo: MediaCodec.BufferInfo) {
+        val arrivalUs = System.nanoTime() / 1000
         if (audioInfo.size <= 0 || audioInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) return
         val source = audioBuffer.duplicate().apply { rewind() }
         val data = ByteArray(source.remaining())
         source.get(data)
         val frame = AudioPreRollBuffer.Frame(data, audioInfo.presentationTimeUs)
+        avSkew.onAudio(audioInfo.presentationTimeUs, arrivalUs)?.let { Log.i("AvSkew", "AvSkew session ${it.toLogLine()}") }
 
         synchronized(lock) {
             audioPreRoll.add(frame)
@@ -404,6 +412,16 @@ class ClipRecorder(
                 finish(clip)
             }
         }
+    }
+
+    @Volatile private var lastAvSkewLogUs = 0L
+
+    /** One "AvSkew" log line per 30 s of arrival time, driven by the video callback. */
+    private fun logAvSkewIfDue(arrivalUs: Long) {
+        val last = lastAvSkewLogUs
+        if (last != 0L && arrivalUs - last < AV_SKEW_LOG_INTERVAL_US) return
+        lastAvSkewLogUs = arrivalUs
+        if (last != 0L) Log.i("AvSkew", avSkew.snapshot().toLogLine())
     }
 
     override fun setVideoFormat(videoFormat: MediaFormat) {

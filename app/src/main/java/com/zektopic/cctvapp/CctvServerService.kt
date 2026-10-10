@@ -857,6 +857,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             getBatteryLevel = { getBatteryLevel() },
             getWifiStrength = { getWifiStrength() },
             getWebAuthEnabled = { AppPreferences.getWebAuthEnabled(this) },
+            getAvSkewJson = { clipRecorder.avSkew.snapshot().toJson() },
             recordApi = recordApi
         )
         webServer.start()
@@ -1512,6 +1513,12 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
     private fun newRtspServerCamera(): RtspServerCamera2 =
         RtspServerCamera2(this, this, 8554).also { it.setRecordController(clipRecorder) }
 
+    /** Diagnostic only: marks the stream start for AvSkewMonitor's first-frame timing. */
+    private fun startRtspStreamTimed() {
+        clipRecorder.avSkew.onStreamStart(System.nanoTime() / 1000, System.currentTimeMillis())
+        rtspServerCamera.startStream()
+    }
+
     private fun startStream() {
         try {
             if (!::rtspServerCamera.isInitialized) {
@@ -1667,7 +1674,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                         GL_CONTENT_ROTATION_DEGREES, false
                     )
                 ) {
-                    rtspServerCamera.startStream()
+                    startRtspStreamTimed()
                     streamHealth.markStarted()
                     applyTimestampOverlay()
                     activeCodec = videoCodec
@@ -1695,7 +1702,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                             GL_CONTENT_ROTATION_DEGREES, false
                         )
                     ) {
-                         rtspServerCamera.startStream()
+                         startRtspStreamTimed()
                          streamHealth.markStarted()
                          applyTimestampOverlay()
                          // Record that THIS session fell back, but do NOT overwrite the
