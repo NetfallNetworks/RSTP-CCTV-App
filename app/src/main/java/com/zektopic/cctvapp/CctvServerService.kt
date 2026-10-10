@@ -857,6 +857,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             getBatteryLevel = { getBatteryLevel() },
             getWifiStrength = { getWifiStrength() },
             getWebAuthEnabled = { AppPreferences.getWebAuthEnabled(this) },
+            getAvSkewJson = { clipRecorder.avSkew.snapshot().toJson() },
             recordApi = recordApi
         )
         webServer.start()

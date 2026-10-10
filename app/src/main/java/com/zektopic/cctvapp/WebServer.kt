@@ -81,6 +81,8 @@ class WebServer(
     private val getBatteryLevel: () -> Int,
     private val getWifiStrength: () -> Int,
     private val getWebAuthEnabled: () -> Boolean,
+    /** JSON object for the diagnostic `avSkew` key; "null" when unavailable. */
+    private val getAvSkewJson: () -> String = { "null" },
     private val recordApi: RecordApi,
     /**
      * Port to bind. Defaults to [PORT]; tests pass [EPHEMERAL_PORT] so they get a free
@@ -336,7 +338,8 @@ class WebServer(
                 "objectDetectorReady":${getObjectDetectorReady()},
                 "batteryLevel":${getBatteryLevel()},
                 "wifiStrength":${getWifiStrength()},
-                "webAuthEnabled":${getWebAuthEnabled()}
+                "webAuthEnabled":${getWebAuthEnabled()},
+                "avSkew":${getAvSkewJson()}
             }""".trimIndent()
             return newFixedLengthResponse(Response.Status.OK, "application/json", json)
         }
