@@ -163,6 +163,50 @@ class ClipRecorderTest {
     }
 
     @Test
+    fun `a file that cannot be finalised at the cap still continues the recording in a new part`() {
+        var opened = 0
+        val r = rig(maxClipUs = 20_000_000L) { m ->
+            if (opened++ == 0) m.failStop = IllegalStateException("Failed to stop the muxer")
+        }
+        advance(r, 6.0)
+        trigger(r)
+        var seconds = 0
+        while (r.muxers.size < 2 && seconds++ < 60) { advance(r, 1.0); trigger(r) }
+
+        val lost = r.failures.single()
+        assertEquals("event-0", lost.eventId)
+        assertEquals(ClipFailureReason.FINALISE_FAILED, lost.reason)
+        assertTrue("the recording goes on after this part", lost.continued)
+        assertEquals("a continuation part is open", "event-1", r.recorder.activeEventId)
+        assertEquals(2, r.muxers.size)
+        assertEquals(1L, r.recorder.stats().clipFailures)
+    }
+
+    @Test
+    fun `when the continuation of a lost part is declined the recording is reported ended once more`() {
+        var opened = 0
+        val r = rig(maxClipUs = 20_000_000L) { m ->
+            if (opened++ == 0) m.failStop = IllegalStateException("Failed to stop the muxer")
+        }
+        advance(r, 6.0)
+        trigger(r)
+        declineRollover = true
+        try {
+            var seconds = 0
+            while (r.failures.size < 2 && seconds++ < 60) { advance(r, 1.0); trigger(r) }
+        } finally {
+            declineRollover = false
+        }
+
+        assertEquals(2, r.failures.size)
+        assertTrue(r.failures[0].continued)
+        assertEquals(ClipFailureReason.ROLLOVER_DECLINED, r.failures[1].reason)
+        assertEquals("event-0", r.failures[1].eventId)
+        assertFalse("this one ends the recording", r.failures[1].continued)
+        assertEquals("the same clip is not counted twice", 1L, r.recorder.stats().clipFailures)
+    }
+
+    @Test
     fun `a declined rollover reports ROLLOVER_DECLINED against the part that was kept`() {
         val r = rig(audio = true, maxClipUs = 20_000_000L)
         advance(r, 6.0)

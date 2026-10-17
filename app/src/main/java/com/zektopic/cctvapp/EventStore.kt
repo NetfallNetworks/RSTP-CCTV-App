@@ -262,6 +262,19 @@ class EventStore(
     }
 
     /**
+     * Whether recording [visitId] still has a part being written or rebuilt other than [exceptId]
+     * (an event `recording` with no clip attached yet): the recording has not ended, so a part
+     * attached now stays held.
+     */
+    fun visitHasOpenPart(visitId: String, exceptId: String): Boolean {
+        synchronized(lock) {
+            return readEventsInternal().any {
+                it.visitId == visitId && it.id != exceptId && it.recording && it.clipFileName == null
+            }
+        }
+    }
+
+    /**
      * Discard of a recording: removes every part of [visitId] and its media, including a
      * part still being written. Returns events removed. Parts already released under media
      * pressure (see [enforceMaxMediaBytes]) are deleted only if still on the device -- the

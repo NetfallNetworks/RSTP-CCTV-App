@@ -480,9 +480,11 @@ class ClipRecorder(
      */
     private fun recordFailure(
         eventId: String, reason: ClipFailureReason, message: String?, recordedMs: Long,
-        hadAudioTrack: Boolean, videoSamples: Int, audioSamples: Int
+        hadAudioTrack: Boolean, videoSamples: Int, audioSamples: Int, continued: Boolean = false
     ): ClipFailure {
-        val failure = ClipFailure(eventId, reason, message, recordedMs, hadAudioTrack, videoSamples, audioSamples)
+        val failure = ClipFailure(
+            eventId, reason, message, recordedMs, hadAudioTrack, videoSamples, audioSamples, continued = continued
+        )
         clipFailures++
         lastFailure = failure
         Log.w(TAG, "Clip $eventId lost: $reason after ${recordedMs} ms ($message)")
@@ -518,8 +520,11 @@ class ClipRecorder(
             maybeDegradeAudio(frame.ptsUs)
             val clip = active ?: return
             if (clip.window.isOver(frame.ptsUs)) {
-                val finished = finish(clip, continued = clip.window.cutShort)
-                if (finished != null && finished.continued) rollOver(finished, clip.window)
+                val cut = clip.window.cutShort
+                val finished = finish(clip, continued = cut)
+                // The recording is still wanted when the cap, not the end rule, ended this file,
+                // whether or not the file survived: carry on in a new part either way.
+                if (cut) rollOver(finished ?: stubOf(clip), clip.window, previousKept = finished != null)
                 return
             }
             try {
@@ -657,11 +662,17 @@ class ClipRecorder(
         clip.audioSamples++
     }
 
+    /** A stand-in for a part that was lost at the cap, so [onRollover] can still copy its event. */
+    private fun stubOf(clip: ActiveClip) = FinishedClip(
+        clip.target.eventId, clip.target.file, 0L, clip.clipStartMs, continued = true,
+        hadAudioTrack = clip.audioTrack != null, videoSamples = clip.videoSamples, audioSamples = clip.audioSamples
+    )
+
     /**
      * Continues a clip that hit the length cap while still wanted, in a new file that
      * runs to where the old one would have ended. Caller must hold [lock].
      */
-    private fun rollOver(previous: FinishedClip, window: ClipWindow) = timedStart<Unit> {
+    private fun rollOver(previous: FinishedClip, window: ClipWindow, previousKept: Boolean) = timedStart<Unit> {
         var declinedBecause = "no continuation target"
         val target = try {
             onRollover(previous)
@@ -670,7 +681,18 @@ class ClipRecorder(
             declinedBecause = ClipFailure.detailOf(e)
             null
         }
-        if (target == null) {
+        if (target == null && !previousKept) {
+            // The part that was lost has already been reported (or is being rebuilt), but it was
+            // reported as continuing: tell the caller the recording has ended after all, without
+            // counting the same clip twice.
+            Log.w(TAG, "No continuation after lost clip ${previous.eventId}: $declinedBecause")
+            onClipFailed(
+                ClipFailure(
+                    previous.eventId, ClipFailureReason.ROLLOVER_DECLINED, declinedBecause, 0,
+                    previous.hadAudioTrack, previous.videoSamples, previous.audioSamples
+                )
+            )
+        } else if (target == null) {
             // No continuation after all: [previous] was reported continued (held), so it
             // must be reported again or its recording would never end.
             fail(
@@ -753,12 +775,12 @@ class ClipRecorder(
         val failure = if (countNow) {
             recordFailure(
                 clip.target.eventId, reason, message, clip.recordedUs() / 1000,
-                clip.audioTrack != null, clip.videoSamples, clip.audioSamples
+                clip.audioTrack != null, clip.videoSamples, clip.audioSamples, continued
             )
         } else {
             ClipFailure(
                 clip.target.eventId, reason, message, clip.recordedUs() / 1000,
-                clip.audioTrack != null, clip.videoSamples, clip.audioSamples
+                clip.audioTrack != null, clip.videoSamples, clip.audioSamples, continued = continued
             ).also { lastFailure = it }
         }
         if (stopError != null) clip.target.file.delete()
@@ -770,7 +792,7 @@ class ClipRecorder(
         // recording (so the archive skips it) until that has been decided.
         rebuild(
             failure, journalFile, clip.target.file, clip.clipStartMs, durationUs,
-            originalUsable = stopError == null, alreadyCounted = countNow
+            originalUsable = stopError == null, alreadyCounted = countNow, continued = continued
         )
         return null
     }
@@ -789,7 +811,7 @@ class ClipRecorder(
      */
     private fun rebuild(
         failure: ClipFailure, journal: File, target: File, clipStartMs: Long, originalDurationUs: Long,
-        originalUsable: Boolean, alreadyCounted: Boolean
+        originalUsable: Boolean, alreadyCounted: Boolean, continued: Boolean
     ) {
         val s = safety ?: return
         val recovery = recovery ?: return
@@ -814,7 +836,7 @@ class ClipRecorder(
                         FinishedClip(
                             failure.eventId, target,
                             if (result.hadAudioTrack) scan.lastPtsUs else scan.videoLastPtsUs, clipStartMs,
-                            hadAudioTrack = result.hadAudioTrack,
+                            continued = continued, hadAudioTrack = result.hadAudioTrack,
                             videoSamples = result.videoSamples, audioSamples = result.audioSamples,
                             recoveredFrom = failure
                         )
@@ -826,7 +848,8 @@ class ClipRecorder(
                     val unverified = ClipFailure(
                         failure.eventId, ClipFailureReason.UNVERIFIED,
                         "${failure.message}; rebuild: ${result?.error ?: "crashed"}".take(ClipFailure.MAX_DETAIL_CHARS),
-                        failure.recordedMs, originalAudio, originalVideoSamples, originalAudioSamples
+                        failure.recordedMs, originalAudio, originalVideoSamples, originalAudioSamples,
+                        continued = continued
                     )
                     synchronized(lock) {
                         clipsUnverified++
@@ -835,7 +858,7 @@ class ClipRecorder(
                     journal.delete()
                     onClipFinished(
                         FinishedClip(
-                            failure.eventId, target, originalDurationUs, clipStartMs,
+                            failure.eventId, target, originalDurationUs, clipStartMs, continued,
                             hadAudioTrack = originalAudio,
                             videoSamples = originalVideoSamples, audioSamples = originalAudioSamples,
                             recoveredFrom = unverified, unverified = true

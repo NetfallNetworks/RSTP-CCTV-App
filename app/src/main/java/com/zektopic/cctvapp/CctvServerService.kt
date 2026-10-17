@@ -267,15 +267,21 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             clipTagsCache.remove(clip.eventId)
             val attach = Runnable {
                 val visitId = eventStore.getEvent(clip.eventId)?.visitId ?: clip.eventId
-                // A clip rebuilt from its journal (or kept unverified beside it) carries why.
+                // A part rebuilt from its journal arrives some time after the recording moved on,
+                // possibly after its last part ended and released the visit: it is held only while
+                // another part is still open. A normal part is attached before its continuation
+                // event exists, so it is simply held.
+                val held = clip.continued &&
+                    (clip.recoveredFrom == null || eventStore.visitHasOpenPart(visitId, clip.eventId))
+                // A clip rebuilt from its journal (or kept unverified) carries why.
                 eventStore.attachClip(
                     clip.eventId, clip.file, System.currentTimeMillis(), clip.durationUs / 1000,
                     clip.clipStartMs, timeline?.detectionsJson(), timeline?.activityJson(),
-                    held = clip.continued,
+                    held = held,
                     clipError = clip.recoveredFrom?.toClipError(),
                     recovered = clip.recoveredFrom != null && !clip.unverified
                 )
-                if (!clip.continued) eventStore.releaseVisit(visitId)
+                if (!held) eventStore.releaseVisit(visitId)
             }
             try {
                 detectionExecutor.execute(attach)
@@ -309,9 +315,14 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             clipTagsCache.remove(id)
             val clear = Runnable {
                 val visitId = eventStore.getEvent(id)?.visitId ?: id
-                eventStore.recordClipFailure(id, failure.toClipError(), journalKept = failure.journalKept)
+                // The root cause is kept: a later report about the same part (the recording could
+                // not continue after it was lost) must not replace it.
+                if (failure.journalKept || eventStore.getEvent(id)?.clipError == null) {
+                    eventStore.recordClipFailure(id, failure.toClipError(), journalKept = failure.journalKept)
+                }
                 eventStore.clearRecording(id)
-                eventStore.releaseVisit(visitId)
+                // A lost part whose recording carries on in a continuation leaves the earlier parts held.
+                if (!failure.continued) eventStore.releaseVisit(visitId)
             }
             try {
                 detectionExecutor.execute(clear)

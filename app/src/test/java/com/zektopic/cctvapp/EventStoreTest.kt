@@ -432,6 +432,18 @@ class EventStoreTest {
         eventStore.journalFileFor(id).also { it.writeBytes(ByteArray(bytes)) }
 
     @Test
+    fun `a visit has an open part while a later part is still being written or rebuilt`() {
+        val eventStore = store()
+        val first = part(eventStore)
+        val second = part(eventStore, visitId = first.id)
+        assertEquals("the continuation keeps the visit", first.id, eventStore.getEvent(second.id)!!.visitId)
+        assertTrue(eventStore.visitHasOpenPart(first.id, exceptId = first.id))
+        attach(eventStore, second, held = false)
+        assertFalse(eventStore.visitHasOpenPart(first.id, exceptId = first.id))
+        assertFalse("another visit is not this one's", eventStore.visitHasOpenPart("other", exceptId = first.id))
+    }
+
+    @Test
     fun `an interrupted clip with a journal stays recording for a rebuild, one without is cleared`() {
         val eventStore = store()
         val withJournal = eventStore.createDetectionEvent("person", 0.9, jpeg, recording = true)

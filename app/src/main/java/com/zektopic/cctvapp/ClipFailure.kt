@@ -37,11 +37,17 @@ class ClipFailure(
     val audioSamples: Int,
     val atMs: Long = System.currentTimeMillis(),
     /** The clip could not be rebuilt either, and its journal (the raw data) was left on disk. */
-    val journalKept: Boolean = false
+    val journalKept: Boolean = false,
+    /**
+     * The lost clip was a part of a recording that carries on in a continuation part (it hit the
+     * per-file cap), so the recording has not ended and its earlier parts stay held.
+     */
+    val continued: Boolean = false
 ) {
     /** The same failure, now known to have ended with only the journal left. */
     fun withJournalKept() = ClipFailure(
-        eventId, reason, message, recordedMs, hadAudioTrack, videoSamples, audioSamples, atMs, journalKept = true
+        eventId, reason, message, recordedMs, hadAudioTrack, videoSamples, audioSamples, atMs,
+        journalKept = true, continued = continued
     )
 
     fun toClipError() = ClipError(

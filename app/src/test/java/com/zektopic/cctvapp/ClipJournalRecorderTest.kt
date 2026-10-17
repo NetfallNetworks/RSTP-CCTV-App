@@ -305,6 +305,24 @@ class ClipJournalRecorderTest {
     }
 
     @Test
+    fun `a part lost at the cap is rebuilt and the recording continues in the next part`() {
+        val r = rig(maxClipUs = 20_000_000L) { index, m ->
+            if (index == 0) m.failStop = IllegalStateException("Failed to stop the muxer")
+        }
+        advance(r, 12.0)
+        r.recorder.trigger { newTarget() }
+        var seconds = 0
+        while (r.finished.isEmpty() && seconds++ < 60) { advance(r, 1.0); r.recorder.trigger { newTarget() } }
+
+        val rebuilt = r.finished.first()
+        assertEquals("event-0", rebuilt.eventId)
+        assertNotNull(rebuilt.recoveredFrom)
+        assertTrue("held: the recording is not over", rebuilt.continued)
+        assertEquals("the continuation part is open", "event-1", r.recorder.activeEventId)
+        assertTrue(r.failures.isEmpty())
+    }
+
+    @Test
     fun `each part of a rolled-over recording is journaled and verified on its own`() {
         val r = rig(maxClipUs = 20_000_000L)
         advance(r, 12.0)
