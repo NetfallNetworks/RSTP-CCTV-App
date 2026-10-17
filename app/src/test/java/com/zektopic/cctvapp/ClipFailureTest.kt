@@ -39,12 +39,21 @@ class ClipFailureTest {
         assertEquals(3L, json.getLong("clipsFinalised"))
         assertEquals(1L, json.getLong("clipFailures"))
         assertEquals(364L, json.getLong("clipStartMaxHoldMs"))
+        assertEquals(0L, json.getLong("verifyMaxHoldMs"))
+        assertEquals(0L, json.getLong("rolloverMaxHoldMs"))
         val last = json.getJSONObject("lastClipFailure")
         assertEquals(1234L, last.getLong("atMs"))
         assertEquals("FINALISE_FAILED", last.getString("reason"))
         assertEquals("IOException: \"bad\" path\\n", last.getString("message"))
         assertEquals(0, last.getInt("audioSamples"))
         assertTrue(last.getBoolean("audioTrack"))
+    }
+
+    @Test
+    fun `status json carries how long verification and rollover held the lock`() {
+        val json = JSONObject("{" + ClipStats(maxVerifyHoldMs = 120, maxRolloverHoldMs = 480).toJsonFields() + "}")
+        assertEquals(120L, json.getLong("verifyMaxHoldMs"))
+        assertEquals(480L, json.getLong("rolloverMaxHoldMs"))
     }
 
     @Test

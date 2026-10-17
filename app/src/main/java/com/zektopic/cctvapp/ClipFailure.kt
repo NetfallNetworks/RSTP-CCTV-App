@@ -102,7 +102,11 @@ class ClipStats(
     val journalOpenFailures: Long = 0,
     /** Clips whose journal stopped short because a write to it failed. */
     val journalWriteFailures: Long = 0,
-    val lastJournalProblem: JournalProblem? = null
+    val lastJournalProblem: JournalProblem? = null,
+    /** Longest time verifying a finished MP4 held the recorder's lock, ms (it runs on the encoder thread). */
+    val maxVerifyHoldMs: Long = 0,
+    /** Longest time ending a file at the cap and opening its continuation held the lock, ms. */
+    val maxRolloverHoldMs: Long = 0
 ) {
     /** The /status keys, without surrounding braces, ready to splice into its object. */
     fun toJsonFields(): String =
@@ -110,5 +114,6 @@ class ClipStats(
             "\"clipsRecovered\":$clipsRecovered,\"clipsUnverified\":$clipsUnverified," +
             "\"journalOpenFailures\":$journalOpenFailures,\"journalWriteFailures\":$journalWriteFailures," +
             "\"lastJournalProblem\":${lastJournalProblem?.toJson() ?: "null"}," +
-            "\"clipStartMaxHoldMs\":$maxStartHoldMs,\"lastClipFailure\":${lastFailure?.toJson() ?: "null"}"
+            "\"clipStartMaxHoldMs\":$maxStartHoldMs,\"verifyMaxHoldMs\":$maxVerifyHoldMs," +
+            "\"rolloverMaxHoldMs\":$maxRolloverHoldMs,\"lastClipFailure\":${lastFailure?.toJson() ?: "null"}"
 }

@@ -233,6 +233,8 @@ class ClipRecorder(
     private var maxStartHoldMs = 0L
     private var clipsRecovered = 0L
     private var clipsUnverified = 0L
+    private var maxVerifyHoldMs = 0L
+    private var maxRolloverHoldMs = 0L
     private var journalOpenFailures = 0L
     private var journalWriteFailures = 0L
     private var lastJournalProblem: JournalProblem? = null
@@ -243,7 +245,7 @@ class ClipRecorder(
     /** Counters and the last lost clip, for /status. */
     fun stats(): ClipStats = synchronized(lock) {
         ClipStats(clipsStarted, clipsFinalised, clipFailures, lastFailure, maxStartHoldMs, clipsRecovered, clipsUnverified,
-            journalOpenFailures, journalWriteFailures, lastJournalProblem
+            journalOpenFailures, journalWriteFailures, lastJournalProblem, maxVerifyHoldMs, maxRolloverHoldMs
         )
     }
 
@@ -539,10 +541,17 @@ class ClipRecorder(
             val clip = active ?: return
             if (clip.window.isOver(frame.ptsUs)) {
                 val cut = clip.window.cutShort
+                val rolloverStartedNs = System.nanoTime()
                 val finished = finish(clip, continued = cut)
                 // The recording is still wanted when the cap, not the end rule, ended this file,
                 // whether or not the file survived: carry on in a new part either way.
-                if (cut) rollOver(finished ?: stubOf(clip), clip.window, previousKept = finished != null)
+                if (cut) {
+                    rollOver(finished ?: stubOf(clip), clip.window, previousKept = finished != null)
+                    // Finishing the file, the caller's event creation and opening the next one are
+                    // one stretch under the lock; its length decides whether any of it should move.
+                    val heldMs = (System.nanoTime() - rolloverStartedNs) / 1_000_000
+                    if (heldMs > maxRolloverHoldMs) maxRolloverHoldMs = heldMs
+                }
                 return
             }
             try {
@@ -774,10 +783,14 @@ class ClipRecorder(
         val usableJournal = journalFile != null && safety != null && !clip.journalBroken
         var verifyError: String? = null
         if (stopError == null && usableJournal) {
+            val verifyStartedNs = System.nanoTime()
             verifyError = safety!!.verifier.verify(
                 clip.target.file, ClipExpectation(if (clip.audioTrack != null) 2 else 1, journalSpanUs)
             )
-            Log.i(TAG, "Clip ${clip.target.eventId} verification: ${verifyError ?: "ok"}")
+            // This runs on the encoder thread, under the lock the encoder callbacks wait on.
+            val verifyMs = (System.nanoTime() - verifyStartedNs) / 1_000_000
+            if (verifyMs > maxVerifyHoldMs) maxVerifyHoldMs = verifyMs
+            Log.i(TAG, "Clip ${clip.target.eventId} verification took $verifyMs ms: ${verifyError ?: "ok"}")
         }
         if (stopError == null && verifyError == null) {
             journalFile?.delete()

@@ -402,6 +402,22 @@ class ClipJournalRecorderTest {
     }
 
     @Test
+    fun `how long verification and a rollover hold the lock is measured`() {
+        val verifier = FakeVerifier()
+        verifier.onVerify = { _, _ -> Thread.sleep(30) }
+        val r = rig(verifier, maxClipUs = 20_000_000L)
+        advance(r, 12.0)
+        r.recorder.trigger { newTarget() }
+        var seconds = 0
+        while (r.finished.isEmpty() && seconds++ < 60) { advance(r, 1.0); r.recorder.trigger { newTarget() } }
+
+        val stats = r.recorder.stats()
+        assertTrue("verify held ${stats.maxVerifyHoldMs} ms", stats.maxVerifyHoldMs >= 30)
+        assertTrue("the rollover includes the verification: ${stats.maxRolloverHoldMs} ms", stats.maxRolloverHoldMs >= 30)
+        assertTrue(stats.maxStartHoldMs < stats.maxRolloverHoldMs + 1)
+    }
+
+    @Test
     fun `each part of a rolled-over recording is journaled and verified on its own`() {
         val r = rig(maxClipUs = 20_000_000L)
         advance(r, 12.0)
