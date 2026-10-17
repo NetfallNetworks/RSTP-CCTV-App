@@ -76,6 +76,8 @@ interface ClipFormats {
 class ClipSafety(
     val formats: ClipFormats,
     val verifier: ClipVerifier,
+    /** Opens a clip's journal; tests substitute one that fails. */
+    val journalFactory: (File, JournalHeader) -> ClipJournalWriter = { file, header -> ClipJournalWriter(file, header) },
     /** Where rebuilds run: never the encoder callback thread, never under the recorder lock. */
     val executor: Executor = Executors.newSingleThreadExecutor { Thread(it, "clip-recovery").apply { isDaemon = true } }
 )

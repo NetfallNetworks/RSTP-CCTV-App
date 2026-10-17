@@ -17,19 +17,19 @@ import java.nio.ByteBuffer
 class AndroidClipFormats : ClipFormats {
 
     override fun videoInfo(format: MediaFormat) = JournalVideoInfo(
-        mime = format.getString(MediaFormat.KEY_MIME) ?: MediaFormat.MIMETYPE_VIDEO_AVC,
-        width = format.getInteger(MediaFormat.KEY_WIDTH),
-        height = format.getInteger(MediaFormat.KEY_HEIGHT),
-        frameRate = intOrDefault(format, MediaFormat.KEY_FRAME_RATE),
-        bitrate = intOrDefault(format, MediaFormat.KEY_BIT_RATE),
+        mime = stringOrDefault(format, MediaFormat.KEY_MIME, MediaFormat.MIMETYPE_VIDEO_AVC),
+        width = number(format, MediaFormat.KEY_WIDTH),
+        height = number(format, MediaFormat.KEY_HEIGHT),
+        frameRate = number(format, MediaFormat.KEY_FRAME_RATE),
+        bitrate = number(format, MediaFormat.KEY_BIT_RATE),
         csd0 = bytesOf(format, "csd-0"),
         csd1 = bytesOf(format, "csd-1")
     )
 
     override fun audioInfo(format: MediaFormat) = JournalAudioInfo(
-        mime = format.getString(MediaFormat.KEY_MIME) ?: MediaFormat.MIMETYPE_AUDIO_AAC,
-        sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE),
-        channels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT),
+        mime = stringOrDefault(format, MediaFormat.KEY_MIME, MediaFormat.MIMETYPE_AUDIO_AAC),
+        sampleRate = number(format, MediaFormat.KEY_SAMPLE_RATE),
+        channels = number(format, MediaFormat.KEY_CHANNEL_COUNT),
         csd0 = bytesOf(format, "csd-0")
     )
 
@@ -46,14 +46,23 @@ class AndroidClipFormats : ClipFormats {
             info.csd0?.let { setByteBuffer("csd-0", ByteBuffer.wrap(it)) }
         }
 
-    private fun intOrDefault(format: MediaFormat, key: String): Int =
-        if (format.containsKey(key)) format.getInteger(key) else -1
+    private fun number(format: MediaFormat, key: String): Int =
+        FormatNumbers.read(
+            format.containsKey(key), { format.getInteger(key) }, { format.getFloat(key) }
+        )
+
+    private fun stringOrDefault(format: MediaFormat, key: String, default: String): String =
+        try { format.getString(key) ?: default } catch (_: Exception) { default }
 
     private fun bytesOf(format: MediaFormat, key: String): ByteArray? {
         if (!format.containsKey(key)) return null
-        val buffer = format.getByteBuffer(key)?.duplicate() ?: return null
-        buffer.rewind()
-        return ByteArray(buffer.remaining()).also { buffer.get(it) }
+        return try {
+            val buffer = format.getByteBuffer(key)?.duplicate() ?: return null
+            buffer.rewind()
+            ByteArray(buffer.remaining()).also { buffer.get(it) }
+        } catch (_: Exception) {
+            null
+        }
     }
 }
 

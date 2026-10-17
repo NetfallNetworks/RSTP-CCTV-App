@@ -235,6 +235,22 @@ class DetectionEventTest {
     }
 
     @Test
+    fun `a clip with no journal says so`() {
+        assertEquals(
+            "recorded without a journal: could not be opened: IOException: EACCES",
+            ClipError("NO_JOURNAL", "could not be opened: IOException: EACCES", 0, false, 0, 0).summary()
+        )
+    }
+
+    @Test
+    fun `an unverified clip says it was kept without verification`() {
+        assertEquals(
+            "kept without verification (verification failed: bad; rebuild: bad)",
+            ClipError("UNVERIFIED", "verification failed: bad; rebuild: bad", 5_000, true, 3, 4).summary()
+        )
+    }
+
+    @Test
     fun `a reason from a newer build is shown as written`() {
         assertEquals(
             "disk exploded after 5s (no audio track, 3 video samples)",

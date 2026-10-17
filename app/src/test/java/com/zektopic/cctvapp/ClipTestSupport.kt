@@ -54,9 +54,11 @@ internal class FakeMuxer(private val file: java.io.File? = null) : ClipMuxer {
     fun audio() = samples.filter { it.track == 1 }
 }
 
-internal class FakeFormats : ClipFormats {
-    override fun videoInfo(format: MediaFormat) =
-        JournalVideoInfo("video/avc", 1600, 1200, 30, 1_300_000, byteArrayOf(1), byteArrayOf(2))
+internal class FakeFormats(var failVideoInfo: Boolean = false) : ClipFormats {
+    override fun videoInfo(format: MediaFormat): JournalVideoInfo {
+        if (failVideoInfo) throw IllegalStateException("no such key: frame-rate")
+        return JournalVideoInfo("video/avc", 1600, 1200, 30, 1_300_000, byteArrayOf(1), byteArrayOf(2))
+    }
 
     override fun audioInfo(format: MediaFormat) = JournalAudioInfo("audio/mp4a-latm", 48_000, 1, byteArrayOf(3))
     override fun video(info: JournalVideoInfo) = MediaFormat()

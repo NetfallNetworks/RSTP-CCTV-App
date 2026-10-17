@@ -74,7 +74,7 @@ private const val MAX_CSD_BYTES = 1024 * 1024
  * to the file about every [flushIntervalMs], so a process death loses at most that much. The
  * disk cost is one more write of the stream bitrate.
  */
-class ClipJournalWriter(
+open class ClipJournalWriter(
     val file: File,
     header: JournalHeader,
     private val flushIntervalMs: Long = 1_000L,
@@ -121,7 +121,7 @@ class ClipJournalWriter(
     }
 
     @Synchronized
-    fun append(isVideo: Boolean, ptsUs: Long, keyFrame: Boolean, data: ByteArray) {
+    open fun append(isVideo: Boolean, ptsUs: Long, keyFrame: Boolean, data: ByteArray) {
         out.writeByte(if (isVideo) TYPE_VIDEO else TYPE_AUDIO)
         out.writeLong(ptsUs)
         out.writeByte(if (keyFrame) FLAG_KEY else 0)

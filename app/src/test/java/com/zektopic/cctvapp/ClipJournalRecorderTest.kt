@@ -41,11 +41,14 @@ class ClipJournalRecorderTest {
     private var nextAudioUs = 0L
     private var targets = 0
     private var dir: File = File("unset")
+    private val noJournalNotes = mutableListOf<Pair<String, String>>()
 
     private fun rig(
         verifier: FakeVerifier = FakeVerifier(),
         targetDir: File = tempFolder.root,
         maxClipUs: Long = ClipRecorder.DEFAULT_MAX_CLIP_US,
+        formats: FakeFormats = FakeFormats(),
+        journalFactory: (File, JournalHeader) -> ClipJournalWriter = { f, h -> ClipJournalWriter(f, h) },
         configure: (Int, FakeMuxer) -> Unit = { _, _ -> }
     ): Rig {
         dir = targetDir
@@ -60,8 +63,10 @@ class ClipJournalRecorderTest {
             onRollover = { newTarget() },
             onClipFailed = { failures.add(it) },
             muxerFactory = { f -> FakeMuxer(f).also { configure(muxers.size, it); muxers.add(it) } },
-            safety = ClipSafety(FakeFormats(), verifier, Executor { it.run() })
+            safety = ClipSafety(formats, verifier, journalFactory, Executor { it.run() }),
+            onNoJournal = { id, reason -> noJournalNotes.add(id to reason) }
         )
+        noJournalNotes.clear()
         recorder.setVideoFormat(MediaFormat())
         recorder.setAudioFormat(MediaFormat())
         return Rig(recorder, muxers, finished, failures, verifier)
@@ -251,7 +256,80 @@ class ClipJournalRecorderTest {
         assertEquals(1L, r.recorder.stats().clipsRecovered)
         assertEquals(0L, r.recorder.stats().clipsUnverified)
     }
-    // --- the safety net must never cost the clip ---
+    // --- the safety net must never cost the clip, and must not vanish silently ---
+
+    /** A journal writer whose append throws once [failAfter] samples are in. */
+    private class FailingJournal(file: File, header: JournalHeader, private val failAfter: Int) :
+        ClipJournalWriter(file, header) {
+        private var n = 0
+        override fun append(isVideo: Boolean, ptsUs: Long, keyFrame: Boolean, data: ByteArray) {
+            if (n++ == failAfter) throw IOException("No space left on device")
+            super.append(isVideo, ptsUs, keyFrame, data)
+        }
+    }
+
+    @Test
+    fun `a journal that cannot be opened is counted, remembered and noted, and the clip still records`() {
+        val r = rig(journalFactory = { _, _ -> throw IOException("EACCES") })
+        recordClip(r)
+
+        assertTrue(r.recorder.stop())
+
+        assertEquals(1, r.finished.size)
+        val stats = r.recorder.stats()
+        assertEquals(1L, stats.journalOpenFailures)
+        assertEquals(0L, stats.journalWriteFailures)
+        assertEquals("open", stats.lastJournalProblem!!.kind)
+        assertEquals("event-0", stats.lastJournalProblem!!.eventId)
+        assertTrue(stats.lastJournalProblem!!.reason.contains("EACCES"))
+        assertEquals(listOf("event-0"), noJournalNotes.map { it.first })
+        assertTrue(noJournalNotes[0].second.startsWith("could not be opened"))
+        assertTrue(journals().isEmpty())
+    }
+
+    @Test
+    fun `a header that cannot be built is the same quiet failure, not a lost clip`() {
+        val r = rig(formats = FakeFormats(failVideoInfo = true))
+        recordClip(r)
+
+        assertTrue(r.recorder.stop())
+
+        assertEquals(1, r.finished.size)
+        assertEquals(1L, r.recorder.stats().journalOpenFailures)
+        assertTrue(noJournalNotes.single().second.contains("no such key"))
+    }
+
+    @Test
+    fun `a journal that fails mid-clip is counted and noted, the clip carries on and is not verified against it`() {
+        val r = rig(journalFactory = { f, h -> FailingJournal(f, h, failAfter = 1000) })
+        recordClip(r, seconds = 6.0)
+
+        assertTrue(r.recorder.stop())
+
+        assertEquals(1, r.finished.size)
+        assertNull(r.finished[0].recoveredFrom)
+        assertTrue("a journal that stopped short cannot vouch for the MP4", r.verifier.calls.isEmpty())
+        val stats = r.recorder.stats()
+        assertEquals(1L, stats.journalWriteFailures)
+        assertEquals("write", stats.lastJournalProblem!!.kind)
+        assertTrue(noJournalNotes.single().second.startsWith("stopped mid-clip"))
+        assertTrue("the short journal is removed once the MP4 finalised", journals().isEmpty())
+    }
+
+    @Test
+    fun `a clip whose journal stopped short and whose stop throws is rebuilt from what the journal has`() {
+        val r = rig(journalFactory = { f, h -> FailingJournal(f, h, failAfter = 1000) }) { index, m ->
+            if (index == 0) m.failStop = IllegalStateException("Failed to stop the muxer")
+        }
+        recordClip(r, seconds = 6.0)
+
+        r.recorder.stop()
+
+        val clip = r.finished.single()
+        assertNotNull(clip.recoveredFrom)
+        assertEquals("only what was journaled", 1000, clip.videoSamples + clip.audioSamples)
+        assertEquals(1L, r.recorder.stats().journalWriteFailures)
+    }
 
     @Test
     fun `a clip whose journal cannot be opened records and finishes as it always did`() {

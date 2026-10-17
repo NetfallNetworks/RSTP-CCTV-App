@@ -70,7 +70,12 @@ class ClipRecorder(
      * verification, rebuilds it from the journal on [ClipSafety.executor]. Null: no journal,
      * and a finalise failure loses the clip as it always did.
      */
-    private val safety: ClipSafety? = null
+    private val safety: ClipSafety? = null,
+    /**
+     * A clip is being recorded without a (complete) journal: it could not be opened, or a write
+     * to it failed. [reason] says why; the caller notes it on the event. Called from inside [lock].
+     */
+    private val onNoJournal: (eventId: String, reason: String) -> Unit = { _, _ -> }
 ) : RecordController {
 
     companion object {
@@ -221,13 +226,18 @@ class ClipRecorder(
     private var maxStartHoldMs = 0L
     private var clipsRecovered = 0L
     private var clipsUnverified = 0L
+    private var journalOpenFailures = 0L
+    private var journalWriteFailures = 0L
+    private var lastJournalProblem: JournalProblem? = null
 
     private val recovery: ClipRecovery? =
         safety?.let { ClipRecovery(JournalReplay(muxerFactory, it.formats), it.verifier) }
 
     /** Counters and the last lost clip, for /status. */
     fun stats(): ClipStats = synchronized(lock) {
-        ClipStats(clipsStarted, clipsFinalised, clipFailures, lastFailure, maxStartHoldMs, clipsRecovered, clipsUnverified)
+        ClipStats(clipsStarted, clipsFinalised, clipFailures, lastFailure, maxStartHoldMs, clipsRecovered, clipsUnverified,
+            journalOpenFailures, journalWriteFailures, lastJournalProblem
+        )
     }
 
     /**
@@ -464,13 +474,14 @@ class ClipRecorder(
     ): ClipJournalWriter? {
         val s = safety ?: return null
         return try {
-            ClipJournalWriter(
+            s.journalFactory(
                 journalFileFor(target.file),
                 JournalHeader(clipStartMs, s.formats.videoInfo(video), audio?.let { s.formats.audioInfo(it) })
             )
         } catch (e: Exception) {
             Log.e(TAG, "Could not open the journal for clip ${target.eventId}; recording without one", e)
             journalFileFor(target.file).delete()
+            noteJournalProblem(target.eventId, "open", "could not be opened: ${ClipFailure.detailOf(e)}")
             null
         }
     }
@@ -626,6 +637,13 @@ class ClipRecorder(
         }
     }
 
+    /** Counts a clip losing its safety net, remembers why, and tells the caller. Caller must hold [lock]. */
+    private fun noteJournalProblem(eventId: String, kind: String, reason: String) {
+        if (kind == "open") journalOpenFailures++ else journalWriteFailures++
+        lastJournalProblem = JournalProblem(System.currentTimeMillis(), eventId, kind, reason)
+        onNoJournal(eventId, reason)
+    }
+
     /**
      * Appends to the clip's journal, if it has one. A journal that cannot be written must never
      * cost the clip: it is dropped (and can then no longer vouch for the MP4) and recording goes on.
@@ -636,6 +654,7 @@ class ClipRecorder(
             journal.append(isVideo, relPtsUs, keyFrame, data)
         } catch (e: Exception) {
             Log.e(TAG, "Journal write failed for clip ${clip.target.eventId}; continuing without it", e)
+            noteJournalProblem(clip.target.eventId, "write", "stopped mid-clip: ${ClipFailure.detailOf(e)}")
             clip.journalBroken = true
             clip.journal = null
             journal.close()

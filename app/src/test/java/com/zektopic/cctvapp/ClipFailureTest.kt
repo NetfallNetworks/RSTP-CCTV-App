@@ -48,6 +48,17 @@ class ClipFailureTest {
     }
 
     @Test
+    fun `status json carries the journal problems`() {
+        val problem = JournalProblem(77L, "e1", "open", "could not be opened: EACCES")
+        val json = JSONObject("{" + ClipStats(journalOpenFailures = 2, journalWriteFailures = 1, lastJournalProblem = problem).toJsonFields() + "}")
+        assertEquals(2L, json.getLong("journalOpenFailures"))
+        assertEquals(1L, json.getLong("journalWriteFailures"))
+        assertEquals("open", json.getJSONObject("lastJournalProblem").getString("kind"))
+        assertEquals("could not be opened: EACCES", json.getJSONObject("lastJournalProblem").getString("reason"))
+        assertTrue(JSONObject("{" + ClipStats().toJsonFields() + "}").isNull("lastJournalProblem"))
+    }
+
+    @Test
     fun `status json has a null last failure before any`() {
         val json = JSONObject("{" + ClipStats().toJsonFields() + "}")
         assertTrue(json.isNull("lastClipFailure"))

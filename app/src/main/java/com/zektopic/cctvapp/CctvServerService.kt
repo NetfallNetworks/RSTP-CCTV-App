@@ -317,7 +317,8 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                 val visitId = eventStore.getEvent(id)?.visitId ?: id
                 // The root cause is kept: a later report about the same part (the recording could
                 // not continue after it was lost) must not replace it.
-                if (failure.journalKept || eventStore.getEvent(id)?.clipError == null) {
+                val existing = eventStore.getEvent(id)?.clipError
+                if (failure.journalKept || existing == null || existing.reason == "NO_JOURNAL") {
                     eventStore.recordClipFailure(id, failure.toClipError(), journalKept = failure.journalKept)
                 }
                 eventStore.clearRecording(id)
@@ -331,7 +332,21 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             }
         },
         // Journals every clip and rebuilds one that cannot be finalised or fails verification.
-        safety = ClipSafety(AndroidClipFormats(), MediaExtractorVerifier())
+        safety = ClipSafety(AndroidClipFormats(), MediaExtractorVerifier()),
+        // A clip with no (complete) journal has no safety net: say so on its event, unless a
+        // more specific error is already there.
+        onNoJournal = { id, reason ->
+            val note = Runnable {
+                if (eventStore.getEvent(id)?.clipError == null) {
+                    eventStore.recordClipFailure(id, ClipError("NO_JOURNAL", reason, 0, false, 0, 0))
+                }
+            }
+            try {
+                detectionExecutor.execute(note)
+            } catch (_: java.util.concurrent.RejectedExecutionException) {
+                note.run()
+            }
+        }
     )
     /**
      * (eventId, tag) pairs already written. Touched from the detection thread (recordClip)

@@ -74,6 +74,15 @@ class ClipFailure(
     }
 }
 
+/**
+ * The safety net failing quietly would be worse than not having one: a clip that could not be
+ * journaled (kind "open") or whose journal stopped short (kind "write") is counted and kept here.
+ */
+class JournalProblem(val atMs: Long, val eventId: String, val kind: String, val reason: String) {
+    fun toJson(): String = org.json.JSONObject()
+        .put("atMs", atMs).put("eventId", eventId).put("kind", kind).put("reason", reason).toString()
+}
+
 /** Counters and the last loss, for /status. Counts every clip part, not every visit. */
 class ClipStats(
     /** Parts opened successfully, including rollover continuations. */
@@ -88,11 +97,18 @@ class ClipStats(
     /** Failed clips that were then rebuilt from their journal and kept (also counted in [clipFailures]). */
     val clipsRecovered: Long = 0,
     /** Clips kept as they finalised although verification (and a rebuild) disagreed; see [ClipFailureReason.UNVERIFIED]. */
-    val clipsUnverified: Long = 0
+    val clipsUnverified: Long = 0,
+    /** Clips recorded with no journal because it could not be opened (or its header built). */
+    val journalOpenFailures: Long = 0,
+    /** Clips whose journal stopped short because a write to it failed. */
+    val journalWriteFailures: Long = 0,
+    val lastJournalProblem: JournalProblem? = null
 ) {
     /** The /status keys, without surrounding braces, ready to splice into its object. */
     fun toJsonFields(): String =
         "\"clipsStarted\":$clipsStarted,\"clipsFinalised\":$clipsFinalised,\"clipFailures\":$clipFailures," +
             "\"clipsRecovered\":$clipsRecovered,\"clipsUnverified\":$clipsUnverified," +
+            "\"journalOpenFailures\":$journalOpenFailures,\"journalWriteFailures\":$journalWriteFailures," +
+            "\"lastJournalProblem\":${lastJournalProblem?.toJson() ?: "null"}," +
             "\"clipStartMaxHoldMs\":$maxStartHoldMs,\"lastClipFailure\":${lastFailure?.toJson() ?: "null"}"
 }
