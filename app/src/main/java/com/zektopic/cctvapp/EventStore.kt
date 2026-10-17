@@ -328,6 +328,22 @@ class EventStore(
         }
     }
 
+    /**
+     * Keeps why event [id]'s clip was lost, so /clips can say so instead of a bare "No clip".
+     * Works on any stored event, including a held part whose continuation failed. Returns false
+     * if the event has been evicted.
+     */
+    fun recordClipFailure(id: String, error: ClipError): Boolean {
+        synchronized(lock) {
+            val events = readEventsInternal()
+            val index = events.indexOfFirst { it.id == id }
+            if (index < 0) return false
+            events[index] = events[index].copy(clipError = error)
+            writeEventsInternal(events)
+            return true
+        }
+    }
+
     private fun removeEvent(id: String): DetectionEvent? {
         synchronized(lock) {
             val events = readEventsInternal()

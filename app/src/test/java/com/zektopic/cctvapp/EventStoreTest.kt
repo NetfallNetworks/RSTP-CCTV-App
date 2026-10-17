@@ -389,6 +389,43 @@ class EventStoreTest {
         assertNotNull("the finished clip must be left alone", eventStore.getEventClipFile(id))
     }
 
+    // --- why a clip was lost ---
+
+    private val finaliseError = ClipError("FINALISE_FAILED", "IllegalStateException: boom", 552_000, true, 16_000, 0)
+
+    @Test
+    fun `a recorded clip failure survives clearing the recording and a reload`() {
+        val eventStore = store()
+        val event = eventStore.createDetectionEvent("person", 0.9, jpeg, recording = true)
+        eventStore.clipFileFor(event.id).writeBytes(ByteArray(10))
+
+        assertTrue(eventStore.recordClipFailure(event.id, finaliseError))
+        assertTrue(eventStore.clearRecording(event.id))
+
+        val stored = EventStore(tempFolder.root).getEvent(event.id)!!
+        assertFalse(stored.recording)
+        assertNull(stored.clipFileName)
+        assertEquals(finaliseError, stored.clipError)
+    }
+
+    @Test
+    fun `recording a clip failure on an unknown event is a no-op`() {
+        assertFalse(store().recordClipFailure("no-such-event-id", finaliseError))
+    }
+
+    @Test
+    fun `a failed continuation is recorded on the held part that kept its clip`() {
+        val eventStore = store()
+        val first = part(eventStore)
+        attach(eventStore, first, held = true)
+
+        eventStore.recordClipFailure(first.id, ClipError("ROLLOVER_DECLINED", null, 120_000, false, 3600, 0))
+
+        val stored = eventStore.getEvent(first.id)!!
+        assertNotNull("the finalised clip is still there", stored.clipFileName)
+        assertEquals("ROLLOVER_DECLINED", stored.clipError?.reason)
+    }
+
     // --- visits: a recording split into rollover parts ---
 
     /** Creates a recording part of [visitId] (null = a first part) with a clip file on disk. */

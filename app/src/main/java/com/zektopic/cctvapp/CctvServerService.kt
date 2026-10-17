@@ -299,11 +299,14 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
         // next process restart runs recoverInterrupted(). Clear it immediately instead.
         // A failure also ends the recording, so release any earlier parts held for it.
         // (clearRecording leaves a held part alone: onRollover declining reports one here.)
-        onClipFailed = { id ->
+        // The failure's cause is stored on the event, so /clips can say why there is no clip.
+        onClipFailed = { failure ->
+            val id = failure.eventId
             clipTimelines.remove(id)
             clipTagsCache.remove(id)
             val clear = Runnable {
                 val visitId = eventStore.getEvent(id)?.visitId ?: id
+                eventStore.recordClipFailure(id, failure.toClipError())
                 eventStore.clearRecording(id)
                 eventStore.releaseVisit(visitId)
             }
@@ -858,6 +861,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             getWifiStrength = { getWifiStrength() },
             getWebAuthEnabled = { AppPreferences.getWebAuthEnabled(this) },
             getAvSkewJson = { clipRecorder.avSkew.snapshot().toJson() },
+            getClipStats = { clipRecorder.stats() },
             recordApi = recordApi
         )
         webServer.start()

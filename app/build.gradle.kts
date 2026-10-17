@@ -92,6 +92,12 @@ android {
         viewBinding = true
     }
 
+    testOptions {
+        // ClipRecorder logs through android.util.Log and passes android.media.MediaFormat
+        // objects around; its JVM tests only need those to be inert, not real.
+        unitTests.isReturnDefaultValues = true
+    }
+
     // Workaround for third-party JNI libs that are not yet 16KB page aligned.
     packaging {
         jniLibs {

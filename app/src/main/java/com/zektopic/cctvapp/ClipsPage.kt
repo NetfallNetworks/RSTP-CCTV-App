@@ -123,7 +123,14 @@ object ClipsPage {
       var meta = el('div', 'meta');
       meta.appendChild(el('div', 'time', pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds())));
       var dur = duration(e);
-      meta.appendChild(el('div', 'sub', e.has_clip ? ('Clip' + (dur ? ' · ' + dur : '')) : (e.end_time ? 'No clip' : 'Recording…')));
+      // A lost clip says why (ClipRecorder's failure report), and so does a recording whose
+      // continuation was lost; the exception text is on hover.
+      var why = e.clip_error_summary ? e.clip_error_summary : null;
+      var status = e.has_clip ? ('Clip' + (dur ? ' · ' + dur : '') + (why ? ' · ' + why : ''))
+        : (e.end_time ? (why ? 'No clip: ' + why : 'No clip') : 'Recording…');
+      var statusEl = el('div', 'sub', status);
+      if (why && e.clip_error_detail) statusEl.title = e.clip_error_detail;
+      meta.appendChild(statusEl);
       var tags = el('div', 'tags');
       tagsOf(e).forEach(function (t) { tags.appendChild(el('span', 'tag ' + t, t)); });
       meta.appendChild(tags);
