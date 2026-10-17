@@ -55,13 +55,22 @@ class ClipRecorder(
      * from [discard]'s return), with why and what had been written ([ClipFailure]). Also
      * called with a [FinishedClip.continued] part's own id when [onRollover] declined or
      * threw, since that recording has now ended after all. Called from inside [lock]; must
-     * not call back into this ClipRecorder. Default keeps other call sites (tests) compiling.
+     * not call back into this ClipRecorder -- except for a clip whose rebuild from its journal
+     * ended with only the journal left ([ClipFailure.journalKept]), which arrives from the
+     * recovery thread instead, as does [onClipFinished] for a rebuilt clip. Both are safe to
+     * post elsewhere. Default keeps other call sites (tests) compiling.
      */
     private val onClipFailed: (ClipFailure) -> Unit = {},
     /** Diagnostic only (see [AvSkewMonitor]); never influences timestamps or recording. */
     val avSkew: AvSkewMonitor = AvSkewMonitor(),
     /** Opens the file a clip is written to; tests substitute a fake. */
-    private val muxerFactory: (File) -> ClipMuxer = { Mp4ClipMuxer(it.path) }
+    private val muxerFactory: (File) -> ClipMuxer = { Mp4ClipMuxer(it.path) },
+    /**
+     * Journals every clip beside its MP4 and, when the MP4 cannot be finalised or fails
+     * verification, rebuilds it from the journal on [ClipSafety.executor]. Null: no journal,
+     * and a finalise failure loses the clip as it always did.
+     */
+    private val safety: ClipSafety? = null
 ) : RecordController {
 
     companion object {
@@ -129,7 +138,17 @@ class ClipRecorder(
     class FinishedClip(
         val eventId: String, val file: File, val durationUs: Long, val clipStartMs: Long,
         val continued: Boolean = false,
-        val hadAudioTrack: Boolean = false, val videoSamples: Int = 0, val audioSamples: Int = 0
+        val hadAudioTrack: Boolean = false, val videoSamples: Int = 0, val audioSamples: Int = 0,
+        /**
+         * Set when the clip did not finalise cleanly and was rebuilt from its journal (this
+         * is then the cause), or [damaged]. Such a clip is reported from the recovery thread.
+         */
+        val recoveredFrom: ClipFailure? = null,
+        /**
+         * The MP4 finalised but failed verification and could not be rebuilt either: it is
+         * attached as it is, and its journal (the raw data) is kept beside it.
+         */
+        val damaged: Boolean = false
     )
 
     enum class Outcome {
@@ -152,13 +171,18 @@ class ClipRecorder(
         val audioTrack: Int?,
         val window: ClipWindow,
         /** Wall-clock time of the first frame: now minus the pre-roll already buffered. */
-        val clipStartMs: Long
+        val clipStartMs: Long,
+        /** Null when journaling is off or its file could not be opened. */
+        val journalFile: File? = null,
+        var journal: ClipJournalWriter? = null
     ) {
         var lastVideoPtsUs = Long.MIN_VALUE
         var lastAudioPtsUs = Long.MIN_VALUE
         /** Samples actually handed to the muxer, for a failure report. */
         var videoSamples = 0
         var audioSamples = 0
+        /** A journal write failed: the journal stops short of the clip and cannot vouch for it. */
+        var journalBroken = false
 
         /** How much of the clip's timeline has been written; 0 before the first sample. */
         fun recordedUs(): Long {
@@ -194,10 +218,14 @@ class ClipRecorder(
     private var clipFailures = 0L
     private var lastFailure: ClipFailure? = null
     private var maxStartHoldMs = 0L
+    private var clipsRecovered = 0L
+
+    private val recovery: ClipRecovery? =
+        safety?.let { ClipRecovery(JournalReplay(muxerFactory, it.formats), it.verifier) }
 
     /** Counters and the last lost clip, for /status. */
     fun stats(): ClipStats = synchronized(lock) {
-        ClipStats(clipsStarted, clipsFinalised, clipFailures, lastFailure, maxStartHoldMs)
+        ClipStats(clipsStarted, clipsFinalised, clipFailures, lastFailure, maxStartHoldMs, clipsRecovered)
     }
 
     /**
@@ -384,6 +412,7 @@ class ClipRecorder(
             }
 
         var muxer: ClipMuxer? = null
+        var journal: ClipJournalWriter? = null
         var audioAdded = false
         return try {
             muxer = muxerFactory(target.file)
@@ -392,10 +421,12 @@ class ClipRecorder(
             audioAdded = audioTrack != null
             muxer.start()
             val clipStartMs = System.currentTimeMillis() - (nowUs - startUs) / 1000
+            journal = openJournal(target, format, if (audioTrack != null) audioFormat else null, clipStartMs)
             val clip = ActiveClip(
                 target, muxer, videoTrack, audioTrack,
                 ClipWindow(postRollUs, maxClipUs, startUs, triggeredAtUs),
-                clipStartMs
+                clipStartMs,
+                journalFile = journal?.file, journal = journal
             )
             for (frame in frames) writeVideo(clip, frame)
             if (audioTrack != null) {
@@ -413,6 +444,9 @@ class ClipRecorder(
         } catch (e: Exception) {
             Log.e(TAG, "Could not start clip ${target.eventId}", e)
             try { muxer?.release() } catch (_: Exception) {}
+            // A clip that never started has nothing to rebuild: no journal either.
+            journal?.close()
+            if (safety != null) journalFileFor(target.file).delete()
             target.file.delete()
             fail(target.eventId, ClipFailureReason.START_FAILED, ClipFailure.detailOf(e), 0, audioAdded, 0, 0)
             false
@@ -420,18 +454,45 @@ class ClipRecorder(
     }
 
     /**
-     * Counts a lost clip and reports it ([onClipFailed]) with [message] as the cause.
-     * Caller must hold [lock].
+     * Opens the clip's journal with its track description, or null if journaling is off or the
+     * file cannot be created (the clip then records as it always did, without a safety net).
      */
-    private fun fail(
+    private fun openJournal(
+        target: ClipTarget, video: MediaFormat, audio: MediaFormat?, clipStartMs: Long
+    ): ClipJournalWriter? {
+        val s = safety ?: return null
+        return try {
+            ClipJournalWriter(
+                journalFileFor(target.file),
+                JournalHeader(clipStartMs, s.formats.videoInfo(video), audio?.let { s.formats.audioInfo(it) })
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not open the journal for clip ${target.eventId}; recording without one", e)
+            journalFileFor(target.file).delete()
+            null
+        }
+    }
+
+    /**
+     * Counts a lost clip and records why, without telling [onClipFailed]. Caller must hold [lock].
+     */
+    private fun recordFailure(
         eventId: String, reason: ClipFailureReason, message: String?, recordedMs: Long,
         hadAudioTrack: Boolean, videoSamples: Int, audioSamples: Int
-    ) {
+    ): ClipFailure {
         val failure = ClipFailure(eventId, reason, message, recordedMs, hadAudioTrack, videoSamples, audioSamples)
         clipFailures++
         lastFailure = failure
         Log.w(TAG, "Clip $eventId lost: $reason after ${recordedMs} ms ($message)")
-        onClipFailed(failure)
+        return failure
+    }
+
+    /** [recordFailure], then reports it ([onClipFailed]). Caller must hold [lock]. */
+    private fun fail(
+        eventId: String, reason: ClipFailureReason, message: String?, recordedMs: Long,
+        hadAudioTrack: Boolean, videoSamples: Int, audioSamples: Int
+    ) {
+        onClipFailed(recordFailure(eventId, reason, message, recordedMs, hadAudioTrack, videoSamples, audioSamples))
     }
 
     override fun recordVideo(videoBuffer: ByteBuffer, videoInfo: MediaCodec.BufferInfo) {
@@ -558,9 +619,27 @@ class ClipRecorder(
         }
     }
 
+    /**
+     * Appends to the clip's journal, if it has one. A journal that cannot be written must never
+     * cost the clip: it is dropped (and can then no longer vouch for the MP4) and recording goes on.
+     */
+    private fun journalSample(clip: ActiveClip, isVideo: Boolean, relPtsUs: Long, keyFrame: Boolean, data: ByteArray) {
+        val journal = clip.journal ?: return
+        try {
+            journal.append(isVideo, relPtsUs, keyFrame, data)
+        } catch (e: Exception) {
+            Log.e(TAG, "Journal write failed for clip ${clip.target.eventId}; continuing without it", e)
+            clip.journalBroken = true
+            clip.journal = null
+            journal.close()
+        }
+    }
+
     private fun writeVideo(clip: ActiveClip, frame: PreRollBuffer.Frame) {
         // MediaMuxer rejects non-increasing timestamps, per track.
         if (frame.ptsUs <= clip.lastVideoPtsUs) return
+        // Journal first: if the muxer write throws, the sample is still in the journal.
+        journalSample(clip, true, frame.ptsUs - clip.window.startUs, frame.isKeyFrame, frame.data)
         clip.muxer.writeSample(clip.videoTrack, frame.data, frame.ptsUs - clip.window.startUs, frame.isKeyFrame)
         clip.lastVideoPtsUs = frame.ptsUs
         clip.videoSamples++
@@ -570,6 +649,7 @@ class ClipRecorder(
         val track = clip.audioTrack ?: return
         // Same non-decreasing rule as video, tracked independently per track.
         if (frame.ptsUs <= clip.lastAudioPtsUs) return
+        journalSample(clip, false, frame.ptsUs - clip.window.startUs, false, frame.data)
         clip.muxer.writeSample(track, frame.data, frame.ptsUs - clip.window.startUs, false)
         clip.lastAudioPtsUs = frame.ptsUs
         clip.audioSamples++
@@ -602,10 +682,13 @@ class ClipRecorder(
     }
 
     /**
-     * Ends [clip]. keep=false deletes the file instead of reporting it (Discard).
+     * Ends [clip]. keep=false deletes the file (and journal) instead of reporting it (Discard).
      * [continued]: the caller will open a continuation part next (see
      * [FinishedClip.continued]); only the natural end at the per-file cap passes true.
-     * Returns the finished clip only when kept and finalised. Caller must hold [lock].
+     * Returns the finished clip only when kept and finalised and (with a journal) verified.
+     * A clip that did not finalise, or failed verification, is handed to [rebuild] when it has
+     * a journal and is reported later from the recovery thread; with no journal it is lost, as
+     * before. Caller must hold [lock].
      */
     private fun finish(
         clip: ActiveClip, keep: Boolean = true, continued: Boolean = false, writeError: Exception? = null
@@ -617,6 +700,8 @@ class ClipRecorder(
         // lastAudioPtsUs is Long.MIN_VALUE when there is no audio track (or it never got a
         // sample), which never wins against a real video pts.
         val durationUs = maxOf(clip.lastVideoPtsUs, clip.lastAudioPtsUs) - clip.window.startUs
+        val journalSpanUs = clip.journal?.spanUs ?: 0L
+        clip.journal?.close()
         val stopError: Exception? = try {
             clip.muxer.stop()
             null
@@ -626,32 +711,150 @@ class ClipRecorder(
         } finally {
             try { clip.muxer.release() } catch (_: Exception) {}
         }
-        if (stopError != null || !keep) {
+        val journalFile = clip.journalFile
+        if (!keep) {
+            // Discard is intentional and the caller already has the event id from discard()'s
+            // return, so there is nothing to report and nothing worth rebuilding.
             clip.target.file.delete()
-            // Discard (keep=false) is intentional and the caller already has the event id
-            // from discard()'s return; only a finalisation failure is a failure to report.
-            // A write error that started this is the root cause, so it is what gets reported;
-            // had the file still finalised, the partial clip would have been kept instead.
-            if (stopError != null && keep) {
-                fail(
-                    clip.target.eventId,
-                    if (writeError != null) ClipFailureReason.WRITE_FAILED else ClipFailureReason.FINALISE_FAILED,
-                    ClipFailure.detailOf(writeError ?: stopError), clip.recordedUs() / 1000,
-                    clip.audioTrack != null, clip.videoSamples, clip.audioSamples
-                )
-            }
+            journalFile?.delete()
             return null
         }
-        Log.i(TAG, "Clip ${clip.target.eventId} finished, ${durationUs / 1000} ms")
-        clipsFinalised++
-        val finished = FinishedClip(
-            clip.target.eventId, clip.target.file, durationUs, clip.clipStartMs, continued,
+        // The journal is the source of truth: it goes only once the MP4 has been reopened and
+        // matches it. A journal that stopped short (its own write failed) cannot vouch for the MP4.
+        val usableJournal = journalFile != null && safety != null && !clip.journalBroken
+        var verifyError: String? = null
+        if (stopError == null && usableJournal) {
+            verifyError = safety!!.verifier.verify(
+                clip.target.file, ClipExpectation(if (clip.audioTrack != null) 2 else 1, journalSpanUs)
+            )
+            Log.i(TAG, "Clip ${clip.target.eventId} verification: ${verifyError ?: "ok"}")
+        }
+        if (stopError == null && verifyError == null) {
+            journalFile?.delete()
+            Log.i(TAG, "Clip ${clip.target.eventId} finished, ${durationUs / 1000} ms")
+            clipsFinalised++
+            val finished = FinishedClip(
+                clip.target.eventId, clip.target.file, durationUs, clip.clipStartMs, continued,
+                clip.audioTrack != null, clip.videoSamples, clip.audioSamples
+            )
+            onClipFinished(finished)
+            return finished
+        }
+
+        // A write error that started this is the root cause, so it is what gets reported; had
+        // the file still finalised and verified, the partial clip would have been kept instead.
+        val reason = if (writeError != null) ClipFailureReason.WRITE_FAILED else ClipFailureReason.FINALISE_FAILED
+        val message = (writeError ?: stopError)?.let { ClipFailure.detailOf(it) } ?: "verification failed: $verifyError"
+        val failure = recordFailure(
+            clip.target.eventId, reason, message, clip.recordedUs() / 1000,
             clip.audioTrack != null, clip.videoSamples, clip.audioSamples
         )
-        onClipFinished(finished)
-        return finished
+        if (stopError != null) clip.target.file.delete()
+        if (journalFile == null || safety == null) {
+            onClipFailed(failure)
+            return null
+        }
+        // The journal holds every sample: rebuild from it off this thread, and keep the event
+        // recording (so the archive skips it) until that has been decided.
+        rebuild(failure, journalFile, clip.target.file, clip.clipStartMs, durationUs, originalUsable = stopError == null)
+        return null
     }
 
+    /**
+     * Rebuilds a clip that failed to finalise or verify from its journal on [ClipSafety.executor],
+     * then reports the outcome: [onClipFinished] with [FinishedClip.recoveredFrom] when a rebuilt
+     * (or, if the rebuild failed, the unverified original with [FinishedClip.damaged]) clip is
+     * attached, or [onClipFailed] with [ClipFailure.journalKept] when only the journal is left.
+     */
+    private fun rebuild(
+        failure: ClipFailure, journal: File, target: File, clipStartMs: Long, originalDurationUs: Long,
+        originalUsable: Boolean
+    ) {
+        val s = safety ?: return
+        val recovery = recovery ?: return
+        val originalAudio = failure.hadAudioTrack
+        val originalVideoSamples = failure.videoSamples
+        val originalAudioSamples = failure.audioSamples
+        s.executor.execute {
+            try {
+                val result = recovery.recover(journal, target)
+                val scan = result.scan
+                if (result.rebuilt && scan != null) {
+                    synchronized(lock) { clipsRecovered++ }
+                    onClipFinished(
+                        FinishedClip(
+                            failure.eventId, target,
+                            if (result.hadAudioTrack) scan.lastPtsUs else scan.videoLastPtsUs, clipStartMs,
+                            hadAudioTrack = result.hadAudioTrack,
+                            videoSamples = result.videoSamples, audioSamples = result.audioSamples,
+                            recoveredFrom = failure
+                        )
+                    )
+                } else if (originalUsable) {
+                    // Finalised but unverifiable and unrebuildable: better attached than gone.
+                    onClipFinished(
+                        FinishedClip(
+                            failure.eventId, target, originalDurationUs, clipStartMs,
+                            hadAudioTrack = originalAudio,
+                            videoSamples = originalVideoSamples, audioSamples = originalAudioSamples,
+                            recoveredFrom = failure, damaged = true
+                        )
+                    )
+                } else {
+                    onClipFailed(failure.withJournalKept())
+                }
+            } catch (t: Throwable) {
+                Log.e(TAG, "Recovery of clip ${failure.eventId} crashed; its journal is kept", t)
+                onClipFailed(failure.withJournalKept())
+            }
+        }
+    }
+
+    /**
+     * Rebuilds the clip an interrupted run left behind: [journal] is the only copy of it. Runs on
+     * [ClipSafety.executor] and reports like a live failure would (reason [ClipFailureReason.INTERRUPTED]).
+     * A journal that cannot be read is deleted; anything else it cannot rebuild stays on disk.
+     */
+    fun rebuildInterrupted(eventId: String, target: File, journal: File) {
+        val s = safety ?: return
+        val recovery = recovery ?: return
+        s.executor.execute {
+            try {
+                val result = recovery.recover(journal, target)
+                val scan = result.scan
+                val usable = scan != null && scan.videoSamples > 0
+                val failure = ClipFailure(
+                    eventId, ClipFailureReason.INTERRUPTED,
+                    "recording was interrupted (process or device stopped)",
+                    (scan?.spanUs ?: 0L) / 1000, scan?.header?.audio != null,
+                    scan?.videoSamples ?: 0, scan?.audioSamples ?: 0
+                )
+                synchronized(lock) {
+                    clipFailures++
+                    lastFailure = failure
+                    if (result.rebuilt) clipsRecovered++
+                }
+                if (result.rebuilt && scan != null) {
+                    onClipFinished(
+                        FinishedClip(
+                            eventId, target, if (result.hadAudioTrack) scan.lastPtsUs else scan.videoLastPtsUs,
+                            scan.header.clipStartMs, hadAudioTrack = result.hadAudioTrack,
+                            videoSamples = result.videoSamples, audioSamples = result.audioSamples,
+                            recoveredFrom = failure
+                        )
+                    )
+                } else if (usable) {
+                    onClipFailed(failure.withJournalKept())
+                } else {
+                    journal.delete()
+                    onClipFailed(failure)
+                }
+            } catch (t: Throwable) {
+                Log.e(TAG, "Recovery of interrupted clip $eventId crashed; its journal is kept", t)
+                onClipFailed(ClipFailure(eventId, ClipFailureReason.INTERRUPTED, ClipFailure.detailOf(t), 0, false, 0, 0).withJournalKept())
+            }
+        }
+    }
     private fun isKeyFrame(data: ByteArray, info: MediaCodec.BufferInfo): Boolean {
         if (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0) return true
         // Annex-B start code then the NAL header, as RootEncoder's own check reads it.

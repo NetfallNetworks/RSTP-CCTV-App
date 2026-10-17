@@ -267,10 +267,14 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             clipTagsCache.remove(clip.eventId)
             val attach = Runnable {
                 val visitId = eventStore.getEvent(clip.eventId)?.visitId ?: clip.eventId
+                // A clip rebuilt from its journal (or kept unverified beside it) carries why.
                 eventStore.attachClip(
                     clip.eventId, clip.file, System.currentTimeMillis(), clip.durationUs / 1000,
                     clip.clipStartMs, timeline?.detectionsJson(), timeline?.activityJson(),
-                    held = clip.continued
+                    held = clip.continued,
+                    clipError = clip.recoveredFrom?.toClipError(),
+                    recovered = clip.recoveredFrom != null && !clip.damaged,
+                    journalKept = clip.damaged
                 )
                 if (!clip.continued) eventStore.releaseVisit(visitId)
             }
@@ -306,7 +310,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             clipTagsCache.remove(id)
             val clear = Runnable {
                 val visitId = eventStore.getEvent(id)?.visitId ?: id
-                eventStore.recordClipFailure(id, failure.toClipError())
+                eventStore.recordClipFailure(id, failure.toClipError(), journalKept = failure.journalKept)
                 eventStore.clearRecording(id)
                 eventStore.releaseVisit(visitId)
             }
@@ -315,7 +319,9 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             } catch (_: java.util.concurrent.RejectedExecutionException) {
                 clear.run()
             }
-        }
+        },
+        // Journals every clip and rebuilds one that cannot be finalised or fails verification.
+        safety = ClipSafety(AndroidClipFormats(), MediaExtractorVerifier())
     )
     /**
      * (eventId, tag) pairs already written. Touched from the detection thread (recordClip)
@@ -426,6 +432,8 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
             ArchiveResult.DELETED -> 200 to """{"result":"deleted"}"""
             ArchiveResult.NOT_FOUND -> 404 to """{"result":"not_found"}"""
             ArchiveResult.RECORDING -> 409 to """{"result":"recording"}"""
+            // Its journal is all that is left of a clip; archiving would delete that too.
+            ArchiveResult.JOURNAL_KEPT -> 409 to """{"result":"journal_kept"}"""
         }
     }
 
@@ -468,7 +476,13 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
         createNotificationChannel()
         eventStore = EventStore.forContext(this)
         eventStore.recoverInterrupted()
+        eventStore.deleteOrphanJournals()
         eventStore.cleanupExpired()
+        // A clip an earlier run died in the middle of: its journal is the only copy, so rebuild
+        // it (in the background) rather than dropping it. The event stays `recording` until done.
+        for (event in eventStore.pendingJournalRebuilds()) {
+            clipRecorder.rebuildInterrupted(event.id, eventStore.clipFileFor(event.id), eventStore.journalFileFor(event.id))
+        }
 
         // Load saved settings as defaults
         videoCodec = AppPreferences.getVideoCodec(this)

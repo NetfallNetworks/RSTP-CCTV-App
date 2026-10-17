@@ -18,48 +18,6 @@ import java.nio.ByteBuffer
  */
 class ClipRecorderTest {
 
-    private class FakeMuxer : ClipMuxer {
-        class Sample(val track: Int, val absPtsUs: Long, val relPtsUs: Long, val key: Boolean)
-
-        val tracks = mutableListOf<MediaFormat>()
-        val samples = mutableListOf<Sample>()
-        var started = false
-        var stopped = false
-        var failStart: Exception? = null
-        var failStop: Exception? = null
-        /** The write that would be sample number N (0-based) throws. */
-        var failWriteAt = -1
-
-        override fun addTrack(format: MediaFormat): Int {
-            tracks.add(format)
-            return tracks.size - 1
-        }
-
-        override fun start() {
-            failStart?.let { throw it }
-            started = true
-        }
-
-        override fun writeSample(track: Int, data: ByteArray, ptsUs: Long, keyFrame: Boolean) {
-            if (samples.size == failWriteAt) throw IOException("No space left on device")
-            // The frame's own absolute pts rides in its payload, so a test can see which
-            // source frames a clip holds whatever its timeline is anchored at.
-            samples.add(Sample(track, ByteBuffer.wrap(data).long, ptsUs, keyFrame))
-        }
-
-        override fun stop() {
-            failStop?.let { throw it }
-            if (tracks.indices.any { t -> samples.none { it.track == t } }) {
-                throw IllegalStateException("Failed to stop the muxer")
-            }
-            stopped = true
-        }
-
-        override fun release() {}
-
-        fun video() = samples.filter { it.track == 0 }
-        fun audio() = samples.filter { it.track == 1 }
-    }
 
     private val frameUs = 33_333L
     private val gopFrames = 30

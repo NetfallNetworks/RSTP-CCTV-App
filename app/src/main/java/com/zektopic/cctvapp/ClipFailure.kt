@@ -9,7 +9,9 @@ enum class ClipFailureReason {
     /** A sample write threw mid-clip. */
     WRITE_FAILED,
     /** The per-file cap was reached, the previous part was kept, and no continuation could be opened. */
-    ROLLOVER_DECLINED
+    ROLLOVER_DECLINED,
+    /** The process or device stopped mid-clip; found at the next start from the journal it left. */
+    INTERRUPTED
 }
 
 /**
@@ -28,8 +30,15 @@ class ClipFailure(
     val hadAudioTrack: Boolean,
     val videoSamples: Int,
     val audioSamples: Int,
-    val atMs: Long = System.currentTimeMillis()
+    val atMs: Long = System.currentTimeMillis(),
+    /** The clip could not be rebuilt either, and its journal (the raw data) was left on disk. */
+    val journalKept: Boolean = false
 ) {
+    /** The same failure, now known to have ended with only the journal left. */
+    fun withJournalKept() = ClipFailure(
+        eventId, reason, message, recordedMs, hadAudioTrack, videoSamples, audioSamples, atMs, journalKept = true
+    )
+
     fun toClipError() = ClipError(
         reason = reason.name, detail = message, recordedMs = recordedMs,
         audioTrack = hadAudioTrack, videoSamples = videoSamples, audioSamples = audioSamples
@@ -64,10 +73,13 @@ class ClipStats(
     val clipFailures: Long = 0,
     val lastFailure: ClipFailure? = null,
     /** Longest time one clip start held the recorder's lock, ms; the stall encoder callbacks saw. */
-    val maxStartHoldMs: Long = 0
+    val maxStartHoldMs: Long = 0,
+    /** Failed clips that were then rebuilt from their journal and kept (also counted in [clipFailures]). */
+    val clipsRecovered: Long = 0
 ) {
     /** The /status keys, without surrounding braces, ready to splice into its object. */
     fun toJsonFields(): String =
         "\"clipsStarted\":$clipsStarted,\"clipsFinalised\":$clipsFinalised,\"clipFailures\":$clipFailures," +
+            "\"clipsRecovered\":$clipsRecovered," +
             "\"clipStartMaxHoldMs\":$maxStartHoldMs,\"lastClipFailure\":${lastFailure?.toJson() ?: "null"}"
 }

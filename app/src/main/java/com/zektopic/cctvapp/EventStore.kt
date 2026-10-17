@@ -6,7 +6,8 @@ import org.json.JSONObject
 import java.io.File
 import java.util.UUID
 
-enum class ArchiveResult { DELETED, NOT_FOUND, RECORDING }
+/** [JOURNAL_KEPT]: the event's raw clip data is all that is left of its clip; archiving would delete it. */
+enum class ArchiveResult { DELETED, NOT_FOUND, RECORDING, JOURNAL_KEPT }
 
 /**
  * On-disk store for detection events and their snapshots.
@@ -193,6 +194,9 @@ class EventStore(
     /** Where the clip for event [id] is written while it records. */
     fun clipFileFor(id: String): File = File(mediaDir, "${id}_clip.mp4")
 
+    /** The crash-safe journal beside event [id]'s clip (see [ClipJournalWriter]). */
+    fun journalFileFor(id: String): File = journalFileFor(clipFileFor(id))
+
     /**
      * Records that event [id]'s clip is complete, then evicts the oldest events until
      * media fits under [maxMediaBytes]. Returns false, and deletes the clip, if the event
@@ -207,7 +211,13 @@ class EventStore(
     fun attachClip(
         id: String, clipFile: File, endTimeMs: Long, durationMs: Long?,
         clipStartMs: Long?, detectionsJson: String?, activityJson: String?,
-        held: Boolean = false
+        held: Boolean = false,
+        /** Why the clip needed rebuilding, when [recovered] or [journalKept]. */
+        clipError: ClipError? = null,
+        /** The clip was rebuilt from its journal after failing to finalise. */
+        recovered: Boolean = false,
+        /** The clip is unverified and its journal (raw data) was kept beside it. */
+        journalKept: Boolean = false
     ): Boolean {
         synchronized(lock) {
             val events = readEventsInternal()
@@ -219,7 +229,9 @@ class EventStore(
             events[index] = events[index].copy(
                 clipFileName = clipFile.name, endTimeMs = endTimeMs, clipDurationMs = durationMs,
                 recording = held, clipBytes = clipFile.length(), clipStartMs = clipStartMs,
-                detectionsJson = detectionsJson, activityJson = activityJson
+                detectionsJson = detectionsJson, activityJson = activityJson,
+                clipError = clipError ?: events[index].clipError,
+                clipRecovered = recovered, clipJournalKept = journalKept
             )
             writeEventsInternal(enforceMaxMediaBytes(events))
             return true
@@ -274,6 +286,7 @@ class EventStore(
         synchronized(lock) {
             val event = readEventsInternal().firstOrNull { it.id == id } ?: return ArchiveResult.NOT_FOUND
             if (event.recording) return ArchiveResult.RECORDING
+            if (event.clipJournalKept) return ArchiveResult.JOURNAL_KEPT
             removeEvent(id)
             return ArchiveResult.DELETED
         }
@@ -288,6 +301,12 @@ class EventStore(
      * part of a recording that never got to end (see attachClip's `held`). Its clip is
      * complete, so it is released and kept -- the recording cannot continue after a
      * restart anyway.
+     *
+     * An interrupted clip that has a journal (see [ClipJournalWriter]) is the exception: the
+     * journal holds every sample written, so the clip can be rebuilt. Such an event is left
+     * `recording` -- the archive skips it -- and returned by [pendingJournalRebuilds]; whatever
+     * rebuilds it ends the recording (attachClip on success, clearRecording on failure). Not
+     * counted in the result.
      */
     fun recoverInterrupted(): Int {
         synchronized(lock) {
@@ -297,6 +316,8 @@ class EventStore(
                 if (!events[i].recording) continue
                 if (events[i].clipFileName != null) {
                     events[i] = events[i].copy(recording = false)
+                } else if (journalFileFor(events[i].id).length() > 0) {
+                    continue
                 } else {
                     clipFileFor(events[i].id).delete()
                     events[i] = events[i].copy(recording = false, clipFileName = null)
@@ -305,6 +326,37 @@ class EventStore(
             }
             if (recovered > 0) writeEventsInternal(events)
             return recovered
+        }
+    }
+
+    /** Interrupted recordings whose journal is the only copy of the clip: see [recoverInterrupted]. */
+    fun pendingJournalRebuilds(): List<DetectionEvent> {
+        synchronized(lock) {
+            return readEventsInternal().filter {
+                it.recording && it.clipFileName == null && journalFileFor(it.id).length() > 0
+            }
+        }
+    }
+
+    /**
+     * Deletes journals nothing needs: those of events that no longer exist and of events whose
+     * clip is attached and verified. Kept: a journal waiting to be rebuilt (see
+     * [pendingJournalRebuilds]) and one the event says is the raw data of a damaged clip.
+     * Returns journals deleted.
+     */
+    fun deleteOrphanJournals(): Int {
+        synchronized(lock) {
+            val events = readEventsInternal().associateBy { it.id }
+            var deleted = 0
+            // A rebuild killed halfway leaves its scratch file; the journal it came from is intact.
+            mediaDir.listFiles { f -> f.name.endsWith("_clip.mp4.rebuild") }?.forEach { it.delete() }
+            for (file in mediaDir.listFiles { f -> f.name.endsWith("_clip.journal") } ?: return 0) {
+                val event = events[file.name.removeSuffix("_clip.journal")]
+                val needed = event != null &&
+                    ((event.recording && event.clipFileName == null) || event.clipJournalKept)
+                if (!needed && file.delete()) deleted++
+            }
+            return deleted
         }
     }
 
@@ -333,12 +385,12 @@ class EventStore(
      * Works on any stored event, including a held part whose continuation failed. Returns false
      * if the event has been evicted.
      */
-    fun recordClipFailure(id: String, error: ClipError): Boolean {
+    fun recordClipFailure(id: String, error: ClipError, journalKept: Boolean = false): Boolean {
         synchronized(lock) {
             val events = readEventsInternal()
             val index = events.indexOfFirst { it.id == id }
             if (index < 0) return false
-            events[index] = events[index].copy(clipError = error)
+            events[index] = events[index].copy(clipError = error, clipJournalKept = journalKept)
             writeEventsInternal(events)
             return true
         }
@@ -452,11 +504,12 @@ class EventStore(
 
     private fun mediaBytesOf(event: DetectionEvent): Long =
         listOfNotNull(event.snapshotFileName, event.clipFileName)
-            .sumOf { File(mediaDir, it).length() }
+            .sumOf { File(mediaDir, it).length() } + journalFileFor(event.id).length()
 
     private fun deleteMediaFor(event: DetectionEvent) {
         event.snapshotFileName?.let { File(mediaDir, it).delete() }
         event.clipFileName?.let { File(mediaDir, it).delete() }
+        journalFileFor(event.id).delete()
     }
 
     private fun listEvents(sinceMs: Long?, limit: Int): List<DetectionEvent> {

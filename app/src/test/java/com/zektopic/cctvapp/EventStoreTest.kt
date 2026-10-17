@@ -426,6 +426,124 @@ class EventStoreTest {
         assertEquals("ROLLOVER_DECLINED", stored.clipError?.reason)
     }
 
+    // --- journals: the raw data behind a clip ---
+
+    private fun journalOf(eventStore: EventStore, id: String, bytes: Int = 100): File =
+        eventStore.journalFileFor(id).also { it.writeBytes(ByteArray(bytes)) }
+
+    @Test
+    fun `an interrupted clip with a journal stays recording for a rebuild, one without is cleared`() {
+        val eventStore = store()
+        val withJournal = eventStore.createDetectionEvent("person", 0.9, jpeg, recording = true)
+        val without = eventStore.createDetectionEvent("motion", 0.1, jpeg, recording = true)
+        journalOf(eventStore, withJournal.id)
+        eventStore.clipFileFor(without.id).writeBytes(ByteArray(10))
+
+        assertEquals("only the one with nothing to rebuild is recovered", 1, eventStore.recoverInterrupted())
+
+        assertTrue("still recording: the archive skips it until the rebuild ends", eventStore.getEvent(withJournal.id)!!.recording)
+        assertFalse(eventStore.getEvent(without.id)!!.recording)
+        assertFalse(eventStore.clipFileFor(without.id).exists())
+        assertEquals(listOf(withJournal.id), eventStore.pendingJournalRebuilds().map { it.id })
+        assertEquals(ArchiveResult.RECORDING, eventStore.archiveEvent(withJournal.id))
+        assertTrue("and its journal is untouched", eventStore.journalFileFor(withJournal.id).exists())
+    }
+
+    @Test
+    fun `a rebuilt interrupted clip is attached like any finished one`() {
+        val eventStore = store()
+        val event = eventStore.createDetectionEvent("person", 0.9, jpeg, recording = true)
+        journalOf(eventStore, event.id)
+        eventStore.recoverInterrupted()
+        val clip = eventStore.clipFileFor(event.id).also { it.writeBytes(ByteArray(500)) }
+        val error = ClipError("INTERRUPTED", "recording was interrupted", 9_000, true, 270, 400)
+
+        assertTrue(eventStore.attachClip(event.id, clip, 5_000, 9_000, 1L, null, null, clipError = error, recovered = true))
+
+        val stored = eventStore.getEvent(event.id)!!
+        assertFalse(stored.recording)
+        assertTrue(stored.clipRecovered)
+        assertFalse(stored.clipJournalKept)
+        assertEquals(error, stored.clipError)
+        assertTrue(eventStore.pendingJournalRebuilds().isEmpty())
+        assertEquals(error, EventStore(tempFolder.root).getEvent(event.id)!!.clipError)
+    }
+
+    @Test
+    fun `an event whose journal is all that is left of its clip is never archived`() {
+        val eventStore = store()
+        val event = eventStore.createDetectionEvent("person", 0.9, jpeg, recording = true)
+        journalOf(eventStore, event.id)
+        eventStore.recordClipFailure(event.id, finaliseError, journalKept = true)
+        eventStore.clearRecording(event.id)
+
+        assertTrue(eventStore.getEvent(event.id)!!.clipJournalKept)
+        assertEquals(ArchiveResult.JOURNAL_KEPT, eventStore.archiveEvent(event.id))
+        assertNotNull("still there", eventStore.getEvent(event.id))
+        assertTrue(eventStore.journalFileFor(event.id).exists())
+        assertEquals("a restart does not rebuild or drop it", 0, store().recoverInterrupted())
+        assertTrue(eventStore.pendingJournalRebuilds().isEmpty())
+    }
+
+    @Test
+    fun `orphan journals go, but a pending rebuild and kept raw data stay`() {
+        val eventStore = store()
+        val pending = eventStore.createDetectionEvent("person", 0.9, jpeg, recording = true)
+        val kept = eventStore.createDetectionEvent("person", 0.9, jpeg, recording = true)
+        val finished = eventStore.createDetectionEvent("person", 0.9, jpeg, recording = true)
+        journalOf(eventStore, pending.id)
+        journalOf(eventStore, kept.id)
+        journalOf(eventStore, finished.id)
+        eventStore.recordClipFailure(kept.id, finaliseError, journalKept = true)
+        eventStore.clearRecording(kept.id)
+        eventStore.clipFileFor(finished.id).writeBytes(ByteArray(10))
+        attach(eventStore, finished, held = false)
+        val gone = journalOf(eventStore, "no-such-event")
+        eventStore.clipFileFor("e").let { File(it.parentFile, "x_clip.mp4.rebuild").writeBytes(ByteArray(3)) }
+
+        assertEquals(2, eventStore.deleteOrphanJournals())
+
+        assertFalse(gone.exists())
+        assertFalse("a journal whose clip is attached and verified", eventStore.journalFileFor(finished.id).exists())
+        assertTrue(eventStore.journalFileFor(pending.id).exists())
+        assertTrue(eventStore.journalFileFor(kept.id).exists())
+        assertFalse("a half-built scratch file", File(eventStore.clipFileFor("e").parentFile, "x_clip.mp4.rebuild").exists())
+    }
+
+    @Test
+    fun `a journal is deleted with its event however the event goes`() {
+        val eventStore = store()
+        val a = eventStore.createDetectionEvent("person", 0.9, jpeg, recording = true)
+        val b = part(eventStore)
+        val c = part(eventStore, visitId = b.id)
+        val d = eventStore.createDetectionEvent("motion", 0.1, jpeg, recording = true)
+        for (e in listOf(a, b, c, d)) journalOf(eventStore, e.id)
+        attach(eventStore, d, held = false)
+
+        eventStore.discardEvent(a.id)
+        eventStore.discardVisit(b.id)
+        eventStore.archiveEvent(d.id)
+
+        for (e in listOf(a, b, c, d)) assertFalse(eventStore.journalFileFor(e.id).exists())
+    }
+
+    @Test
+    fun `journals count toward the media cap, so old events are evicted to make room`() {
+        val eventStore = EventStore(tempFolder.root, maxMediaBytes = 3_000L)
+        val old = eventStore.createDetectionEvent("person", 0.9, jpeg, recording = true)
+        eventStore.clipFileFor(old.id).writeBytes(ByteArray(1_000))
+        journalOf(eventStore, old.id, bytes = 5_000)
+        attach(eventStore, old, held = false)
+        Thread.sleep(3)
+        val newer = part(eventStore, clipBytes = 1_000)
+
+        attach(eventStore, newer, held = false)
+
+        assertNull("1 kB of clip alone would have fit; its 5 kB journal did not", eventStore.getEvent(old.id))
+        assertFalse(eventStore.journalFileFor(old.id).exists())
+        assertNotNull(eventStore.getEvent(newer.id))
+    }
+
     // --- visits: a recording split into rollover parts ---
 
     /** Creates a recording part of [visitId] (null = a first part) with a clip file on disk. */

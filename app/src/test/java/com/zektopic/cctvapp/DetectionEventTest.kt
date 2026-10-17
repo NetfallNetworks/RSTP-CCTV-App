@@ -204,6 +204,37 @@ class DetectionEventTest {
     }
 
     @Test
+    fun `recovery flags round trip, are omitted when false, and change the summary`() {
+        val plain = event().copy(clipError = finaliseError)
+        assertFalse(plain.toJsonObject().has("clip_recovered"))
+        assertFalse(plain.toJsonObject().has("clip_journal_kept"))
+
+        val recovered = plain.copy(clipRecovered = true)
+        assertTrue(recovered.toJsonObject().getBoolean("clip_recovered"))
+        assertEquals(recovered, DetectionEvent.fromJsonObject(recovered.toJsonObject()))
+        assertEquals(
+            "recovered from journal after finalise failed after 9m12s (audio track, 0 audio samples, 16000 video samples)",
+            recovered.toJsonObject().getString("clip_error_summary")
+        )
+
+        val damaged = plain.copy(clipJournalKept = true)
+        assertTrue(damaged.toJsonObject().getBoolean("clip_journal_kept"))
+        assertEquals(damaged, DetectionEvent.fromJsonObject(damaged.toJsonObject()))
+        assertEquals(
+            "clip damaged, raw data kept (finalise failed after 9m12s (audio track, 0 audio samples, 16000 video samples))",
+            damaged.toJsonObject().getString("clip_error_summary")
+        )
+    }
+
+    @Test
+    fun `events written before recovery existed load as neither recovered nor damaged`() {
+        val json = JSONObject().put("id", "x").put("type", "person").put("start_time", 1L)
+        val e = DetectionEvent.fromJsonObject(json)
+        assertFalse(e.clipRecovered)
+        assertFalse(e.clipJournalKept)
+    }
+
+    @Test
     fun `a reason from a newer build is shown as written`() {
         assertEquals(
             "disk exploded after 5s (no audio track, 3 video samples)",
