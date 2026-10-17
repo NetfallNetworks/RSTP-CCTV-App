@@ -228,9 +228,21 @@ class ClipRecoveryInstrumentedTest {
         val text = observed.entries.joinToString("\n") { "${it.key}: ${it.value}" }
         val bundle = Bundle()
         for ((case, answer) in observed) bundle.putString("$title.${case.replace(Regex("[^A-Za-z0-9]+"), "_")}", answer)
+        // Reporting must never fail a case: the file is a convenience (its directory does not exist on a
+        // fresh install), and an IO error is itself reported through the status stream.
+        try {
+            val resultsDir = instrumentation.context.cacheDir
+            resultsDir.mkdirs()
+            File(resultsDir, "clip-recovery-results.txt").appendText("== $title ==\n$text\n")
+        } catch (e: Exception) {
+            bundle.putString("$title.results_file_error", "${e.javaClass.simpleName}: ${e.message}")
+        }
         bundle.putString(Instrumentation.REPORT_KEY_STREAMRESULT, "\n== $title ==\n$text\n")
-        instrumentation.sendStatus(0, bundle)
-        File(instrumentation.context.cacheDir, "clip-recovery-results.txt").appendText("== $title ==\n$text\n")
+        try {
+            instrumentation.sendStatus(0, bundle)
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not send the status stream: ${e.message}")
+        }
     }
 
     @Test
