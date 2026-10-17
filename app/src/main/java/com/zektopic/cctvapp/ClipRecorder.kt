@@ -194,6 +194,8 @@ class ClipRecorder(
         /** Samples actually handed to the muxer, for a failure report. */
         var videoSamples = 0
         var audioSamples = 0
+        /** Payload bytes handed to the muxer so far, pre-roll included: a floor for the MP4's size. */
+        var payloadBytes = 0L
         /** A journal write failed: the journal stops short of the clip and cannot vouch for it. */
         var journalBroken = false
 
@@ -685,6 +687,7 @@ class ClipRecorder(
         clip.muxer.writeSample(clip.videoTrack, frame.data, frame.ptsUs - clip.window.startUs, frame.isKeyFrame)
         clip.lastVideoPtsUs = frame.ptsUs
         clip.videoSamples++
+        clip.payloadBytes += frame.data.size
     }
 
     private fun writeAudio(clip: ActiveClip, frame: AudioPreRollBuffer.Frame) {
@@ -695,6 +698,7 @@ class ClipRecorder(
         clip.muxer.writeSample(track, frame.data, frame.ptsUs - clip.window.startUs, false)
         clip.lastAudioPtsUs = frame.ptsUs
         clip.audioSamples++
+        clip.payloadBytes += frame.data.size
     }
 
     /** A stand-in for a part that was lost at the cap, so [onRollover] can still copy its event. */
@@ -785,7 +789,7 @@ class ClipRecorder(
         if (stopError == null && usableJournal) {
             val verifyStartedNs = System.nanoTime()
             verifyError = safety!!.verifier.verify(
-                clip.target.file, ClipExpectation(if (clip.audioTrack != null) 2 else 1, journalSpanUs)
+                clip.target.file, ClipExpectation(if (clip.audioTrack != null) 2 else 1, journalSpanUs, clip.payloadBytes)
             )
             // This runs on the encoder thread, under the lock the encoder callbacks wait on.
             val verifyMs = (System.nanoTime() - verifyStartedNs) / 1_000_000

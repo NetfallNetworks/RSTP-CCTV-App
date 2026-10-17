@@ -9,10 +9,15 @@ import java.util.concurrent.Executors
 import kotlin.math.abs
 
 /** What a finalised MP4 should look like, from what the journal says was written to it. */
-class ClipExpectation(val tracks: Int, val spanUs: Long)
+/**
+ * [minBytes]: the payload bytes of every sample written to the MP4. The file holds at least that
+ * much (the container only adds to it), whatever the extractor can read of its index.
+ */
+class ClipExpectation(val tracks: Int, val spanUs: Long, val minBytes: Long = 0)
 
 /** What was actually found in an MP4 (see [ClipVerifier]). */
-class ClipProbe(val tracks: Int, val tracksWithSamples: Int, val durationUs: Long?)
+/** [fileBytes]: the file's length, or -1 if not known. */
+class ClipProbe(val tracks: Int, val tracksWithSamples: Int, val durationUs: Long?, val fileBytes: Long = -1)
 
 /** The rule that decides whether an MP4 can be trusted enough for its journal to be deleted. */
 object ClipVerification {
@@ -29,6 +34,18 @@ object ClipVerification {
     fun toleranceUs(expectedSpanUs: Long): Long = maxOf(MIN_TOLERANCE_US, expectedSpanUs / 10)
 
     /**
+     * A file shorter than the sample data that was written to it is cut off, whatever its index
+     * says: some muxers reserve the index near the front, so an extractor can read a complete
+     * sample table from a file whose media data stops half way. Needs no extractor.
+     */
+    fun checkSize(expect: ClipExpectation, fileBytes: Long): String? =
+        if (expect.minBytes > 0 && fileBytes < expect.minBytes) {
+            "file is $fileBytes bytes, less than the ${expect.minBytes} bytes of sample data written to it"
+        } else {
+            null
+        }
+
+    /**
      * Whether a track's index reaches the end of the clip: the latest sample time seen while
      * walking its tail ([lastSampleUs], -1 if none) is within the tolerance of its [durationUs].
      * A track with no known duration only needs to have yielded something.
@@ -41,6 +58,7 @@ object ClipVerification {
 
     /** Null when [probe] matches [expect]; otherwise why not. */
     fun check(expect: ClipExpectation, probe: ClipProbe): String? {
+        if (probe.fileBytes >= 0) checkSize(expect, probe.fileBytes)?.let { return it }
         if (probe.tracks != expect.tracks) return "expected ${expect.tracks} tracks, found ${probe.tracks}"
         if (probe.tracksWithSamples != probe.tracks) {
             return "only ${probe.tracksWithSamples} of ${probe.tracks} tracks yield samples"
@@ -92,7 +110,8 @@ class ClipSafety(
 /** Writes a journal back out as an MP4 with a fresh muxer, streaming so the clip is never held in memory. */
 class JournalReplay(private val muxerFactory: (File) -> ClipMuxer, private val formats: ClipFormats) {
 
-    class Result(val videoSamples: Int, val audioSamples: Int, val hadAudioTrack: Boolean)
+    /** [payloadBytes]: the sample bytes written to the new MP4 (see [ClipExpectation.minBytes]). */
+    class Result(val videoSamples: Int, val audioSamples: Int, val hadAudioTrack: Boolean, val payloadBytes: Long)
 
     /** Throws if the journal cannot be read or the muxer fails; [out] is deleted in that case. */
     fun replay(journal: File, out: File, includeAudio: Boolean, scan: JournalScan): Result {
@@ -112,6 +131,7 @@ class JournalReplay(private val muxerFactory: (File) -> ClipMuxer, private val f
                 var lastAudio = Long.MIN_VALUE
                 var videoSamples = 0
                 var audioSamples = 0
+                var payloadBytes = 0L
                 while (true) {
                     val s = reader.next() ?: break
                     // The same non-decreasing rule the live writer applied per track.
@@ -120,16 +140,18 @@ class JournalReplay(private val muxerFactory: (File) -> ClipMuxer, private val f
                         m.writeSample(videoTrack, s.data, s.ptsUs, s.keyFrame)
                         lastVideo = s.ptsUs
                         videoSamples++
+                        payloadBytes += s.data.size
                     } else if (withAudio) {
                         if (s.ptsUs <= lastAudio) continue
                         m.writeSample(audioTrack, s.data, s.ptsUs, false)
                         lastAudio = s.ptsUs
                         audioSamples++
+                        payloadBytes += s.data.size
                     }
                 }
                 if (videoSamples == 0) throw IOException("journal holds no video")
                 m.stop()
-                return Result(videoSamples, audioSamples, withAudio)
+                return Result(videoSamples, audioSamples, withAudio, payloadBytes)
             }
         } catch (e: Exception) {
             out.delete()
@@ -203,7 +225,8 @@ class ClipRecovery(
                 val r = replay.replay(journal, temp, withAudio, scan)
                 val expect = ClipExpectation(
                     tracks = if (r.hadAudioTrack) 2 else 1,
-                    spanUs = if (r.hadAudioTrack) scan.spanUs else scan.videoSpanUs
+                    spanUs = if (r.hadAudioTrack) scan.spanUs else scan.videoSpanUs,
+                    minBytes = r.payloadBytes
                 )
                 val bad = verifier.verify(temp, expect)
                 if (bad == null) {

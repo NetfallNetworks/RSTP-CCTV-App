@@ -85,6 +85,13 @@ class MediaExtractorVerifier : ClipVerifier {
 
     override fun verify(file: File, expect: ClipExpectation): String? {
         val startedMs = SystemClock.elapsedRealtime()
+        // First, the check that needs no extractor: a file shorter than the sample data written to
+        // it is cut off, even if its index (reserved near the front by some muxers) reads fine.
+        val fileBytes = file.length()
+        ClipVerification.checkSize(expect, fileBytes)?.let {
+            Log.i(TAG, "${file.name}: $it -> rejected")
+            return it
+        }
         val extractor = MediaExtractor()
         var tracks = -1
         var withSamples = -1
@@ -116,14 +123,14 @@ class MediaExtractorVerifier : ClipVerifier {
                 extractor.unselectTrack(i)
                 if (ok) withSamples++
             }
-            result = ClipVerification.check(expect, ClipProbe(tracks, withSamples, durationUs))
+            result = ClipVerification.check(expect, ClipProbe(tracks, withSamples, durationUs, fileBytes))
         } catch (e: Exception) {
             result = "could not open: ${ClipFailure.detailOf(e)}"
         } finally {
             try { extractor.release() } catch (_: Exception) {}
             Log.i(
                 TAG,
-                "${file.name}: tracks=$tracks (expected ${expect.tracks}) withSamples=$withSamples " +
+                "${file.name}: bytes=$fileBytes (payload ${expect.minBytes}) tracks=$tracks (expected ${expect.tracks}) withSamples=$withSamples " +
                     "duration=${durationUs?.div(1000)} ms (journal span ${expect.spanUs / 1000} ms) " +
                     "in ${SystemClock.elapsedRealtime() - startedMs} ms -> ${result ?: "ok"}"
             )

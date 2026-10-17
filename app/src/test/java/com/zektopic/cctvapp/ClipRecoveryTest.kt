@@ -78,6 +78,26 @@ class ClipRecoveryTest {
     }
 
     @Test
+    fun `a file shorter than the sample data written to it is rejected before anything is read`() {
+        val expect = ClipExpectation(2, 60_000_000, minBytes = 1_000_000)
+        assertEquals(
+            "file is 999999 bytes, less than the 1000000 bytes of sample data written to it",
+            ClipVerification.checkSize(expect, 999_999)
+        )
+        assertNull("exactly the payload is as small as a file can be", ClipVerification.checkSize(expect, 1_000_000))
+        assertNull("the container only adds", ClipVerification.checkSize(expect, 1_030_000))
+        assertNull("no byte total to compare with", ClipVerification.checkSize(ClipExpectation(1, 5_000_000), 10))
+    }
+
+    @Test
+    fun `the size check is part of check, and an unknown file length skips it`() {
+        val expect = ClipExpectation(1, 60_000_000, minBytes = 500)
+        assertNotNull(ClipVerification.check(expect, ClipProbe(1, 1, 60_000_000, fileBytes = 400)))
+        assertNull(ClipVerification.check(expect, ClipProbe(1, 1, 60_000_000, fileBytes = 500)))
+        assertNull(ClipVerification.check(expect, ClipProbe(1, 1, 60_000_000)))
+    }
+
+    @Test
     fun `short clips get a three second tolerance and very short ones are not duration-checked`() {
         assertEquals(3_000_000L, ClipVerification.toleranceUs(5_000_000))
         assertEquals(10_000_000L, ClipVerification.toleranceUs(100_000_000))
@@ -116,6 +136,7 @@ class ClipRecoveryTest {
         assertEquals(30, m.audio().size)
         assertEquals("verified against the journal's own span", 2, r.verifier.calls.single().tracks)
         assertEquals(2_950_000L, r.verifier.calls.single().spanUs)
+        assertEquals("30 video samples of 4 bytes and 30 audio of 2", 180L, r.verifier.calls.single().minBytes)
         assertTrue("the rebuilt file is in place", target().exists())
         assertFalse(scratch().exists())
         assertFalse("verified, so the journal goes", journal().exists())
@@ -154,6 +175,7 @@ class ClipRecoveryTest {
         assertTrue(result.error!!.contains("with audio"))
         assertEquals("the second verification expects one track", 1, r.verifier.calls.single().tracks)
         assertEquals("and the video span only", 2_900_000L, r.verifier.calls.single().spanUs)
+        assertEquals("and the video bytes only", 120L, r.verifier.calls.single().minBytes)
         assertFalse(journal().exists())
         assertTrue(target().exists())
     }

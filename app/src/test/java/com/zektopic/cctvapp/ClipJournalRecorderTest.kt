@@ -134,6 +134,10 @@ class ClipJournalRecorderTest {
         val expectation = verifier.calls.single()
         assertEquals(2, expectation.tracks)
         assertEquals(m.samples.maxOf { it.relPtsUs } - m.samples.minOf { it.relPtsUs }, expectation.spanUs)
+        assertEquals(
+            "the floor for the file size is every payload byte given to the muxer, pre-roll included",
+            m.samples.sumOf { it.data.size.toLong() }, expectation.minBytes
+        )
         assertEquals(1, r.finished.size)
         assertNull(r.finished[0].recoveredFrom)
         assertTrue("verified, so the journal is deleted", journals().isEmpty())
@@ -164,6 +168,44 @@ class ClipJournalRecorderTest {
         assertEquals(1L, stats.clipFailures)
         assertEquals(1L, stats.clipsRecovered)
         assertEquals(0L, stats.clipsFinalised)
+    }
+
+    @Test
+    fun `an MP4 shorter than its payload bytes is rejected and rebuilt, on the live path and the rebuild path`() {
+        val reported = ArrayDeque(listOf<Long>(-1, Long.MAX_VALUE)) // live file cut short, rebuilt one fine
+        val seen = mutableListOf<ClipExpectation>()
+        val verifier = FakeVerifier()
+        verifier.onVerify = { _, expect -> seen.add(expect) }
+        val sizeAware = object : ClipVerifier {
+            override fun verify(file: File, expect: ClipExpectation): String? {
+                verifier.verify(file, expect)
+                val length = reported.removeFirst().let { if (it < 0) expect.minBytes - 1 else it }
+                return ClipVerification.checkSize(expect, length)
+            }
+        }
+        val r = rig(FakeVerifier())
+        // Same rig, but with the size-aware verifier standing in.
+        val recorder = ClipRecorder(
+            onClipFinished = { r.finished.add(it) }, onRollover = { null },
+            muxerFactory = { f -> FakeMuxer(f).also { r.muxers.add(it) } },
+            safety = ClipSafety(FakeFormats(), sizeAware, executor = Executor { it.run() })
+        )
+        r.muxers.clear()
+        r.finished.clear()
+        recorder.setVideoFormat(MediaFormat())
+        recorder.setAudioFormat(MediaFormat())
+        val own = Rig(recorder, r.muxers, r.finished, r.failures, verifier)
+        nextVideoFrame = 0
+        nextAudioUs = 0
+        recordClip(own)
+
+        recorder.stop()
+
+        assertEquals("live path then rebuild path", 2, seen.size)
+        assertEquals(own.muxers[0].samples.sumOf { it.data.size.toLong() }, seen[0].minBytes)
+        assertEquals(own.muxers[1].samples.sumOf { it.data.size.toLong() }, seen[1].minBytes)
+        val clip = own.finished.single()
+        assertTrue(clip.recoveredFrom!!.message!!.startsWith("verification failed: file is"))
     }
 
     @Test
