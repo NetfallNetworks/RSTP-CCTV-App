@@ -290,4 +290,39 @@ class ClipRecorderTest {
         assertTrue(r.failures.isEmpty())
         assertEquals(1, r.finished.size)
     }
+
+    // --- more pre-roll, same audio freshness bound ---
+
+    @Test
+    fun `pre-roll is ten seconds and audio freshness stays five`() {
+        assertEquals(10_000_000L, ClipRecorder.DEFAULT_PRE_ROLL_US)
+        assertEquals(5_000_000L, ClipRecorder.AUDIO_WAIT_TIMEOUT_US)
+    }
+
+    @Test
+    fun `a clip opens with at least ten seconds before the trigger`() {
+        val r = rig()
+        advance(r, 40.0)
+        val triggerUs = baseUs + (nextVideoFrame - 1) * frameUs
+
+        trigger(r)
+
+        val firstUs = r.muxers.single().video().first().absPtsUs
+        assertTrue("pre-roll was ${(triggerUs - firstUs) / 1000} ms", triggerUs - firstUs >= 10_000_000L)
+        assertTrue(r.muxers.single().video().first().key)
+    }
+
+    @Test
+    fun `audio that went quiet six seconds ago is not trusted for a new clip`() {
+        val r = rig(audio = true)
+        advance(r, 10.0)
+        audioOn = false
+        advance(r, 6.0)
+
+        assertEquals(ClipRecorder.Outcome.STARTED, trigger(r).outcome)
+        advance(r, 1.0)
+
+        assertEquals("video only", 1, r.muxers.single().tracks.size)
+        assertNotNull(r.recorder.activeEventId)
+    }
 }

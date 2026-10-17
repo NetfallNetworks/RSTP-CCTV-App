@@ -67,7 +67,11 @@ class ClipRecorder(
     companion object {
         private const val TAG = "ClipRecorder"
         private const val AV_SKEW_LOG_INTERVAL_US = 30_000_000L
-        const val DEFAULT_PRE_ROLL_US = 5_000_000L
+        /**
+         * Ten seconds, so a clip that starts late (a slow detection pass, a busy device) still
+         * opens before the subject arrived. About 1.5 MB of RAM at frankie's stream bitrate.
+         */
+        const val DEFAULT_PRE_ROLL_US = 10_000_000L
 
         /**
          * Long, because animals move slowly and in bursts -- a cat can sit still for half
@@ -78,7 +82,7 @@ class ClipRecorder(
         /** Per file, not per event: activity beyond it continues in a rollover clip. */
         const val DEFAULT_MAX_CLIP_US = 600_000_000L
 
-        /** Ceiling for the pre-roll; several times what 7 s at stream bitrates needs. */
+        /** Ceiling for the pre-roll; several times what 10 s at stream bitrates needs. */
         private const val MAX_BUFFER_BYTES = 16L * 1024 * 1024
 
         /** AAC at 64 kbps for a few seconds' pre-roll is tiny; this is generous headroom. */
@@ -104,12 +108,14 @@ class ClipRecorder(
          * but never given a single sample throws on stop(), so a clip should only get one
          * when audio looks alive right now, not merely "was configured".
          *
-         * Same order as the pre-roll: ordinary microphone/encoder init latency is near
+         * Deliberately its own figure, not the pre-roll: it was once defined as the pre-roll,
+         * and lengthening the pre-roll would have silently made a quiet microphone count as
+         * alive for twice as long. Ordinary microphone/encoder init latency is near
          * instant, so this never trips in the healthy case, while a real failure -- audio
          * expected but never actually arriving, or having silently stopped -- now costs at
          * most a few seconds of clips instead of the recording silently disappearing.
          */
-        const val AUDIO_WAIT_TIMEOUT_US = DEFAULT_PRE_ROLL_US
+        const val AUDIO_WAIT_TIMEOUT_US = 5_000_000L
         private const val H264_NAL_IDR = 5
     }
 
