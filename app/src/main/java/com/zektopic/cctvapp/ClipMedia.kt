@@ -2,6 +2,7 @@ package com.zektopic.cctvapp
 
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import android.os.Build
 import android.os.SystemClock
 import android.util.Log
 import java.io.File
@@ -81,6 +82,24 @@ class MediaExtractorVerifier : ClipVerifier {
 
         /** Samples stepped over in the tail walk at most (a few seconds of video plus audio). */
         private const val MAX_TAIL_STEPS = 3_000
+
+        /** Room for one sample; keyframes at this stream's bitrates are a fraction of it. */
+        private const val INITIAL_READ_BUFFER_BYTES = 1024 * 1024
+    }
+
+    /** One verification's scratch space for sample bytes; per call, because verify() can run on two threads. */
+    private class ReadBuffer {
+        var buffer: ByteBuffer = ByteBuffer.allocate(INITIAL_READ_BUFFER_BYTES)
+    }
+
+    /** Reads the current sample's bytes into [scratch] (grown if the sample is bigger); -1 at the end. */
+    private fun readSample(extractor: MediaExtractor, scratch: ReadBuffer): Int {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            val need = extractor.sampleSize
+            if (need > scratch.buffer.capacity()) scratch.buffer = ByteBuffer.allocate(need.toInt())
+        }
+        scratch.buffer.clear()
+        return extractor.readSampleData(scratch.buffer, 0)
     }
 
     override fun verify(file: File, expect: ClipExpectation): String? {
@@ -93,6 +112,7 @@ class MediaExtractorVerifier : ClipVerifier {
             return it
         }
         val extractor = MediaExtractor()
+        val scratch = ReadBuffer()
         var tracks = -1
         var withSamples = -1
         var durationUs: Long? = null
@@ -106,19 +126,26 @@ class MediaExtractorVerifier : ClipVerifier {
                 val trackDuration = if (format.containsKey(MediaFormat.KEY_DURATION)) format.getLong(MediaFormat.KEY_DURATION) else null
                 if (trackDuration != null) durationUs = maxOf(durationUs ?: 0L, trackDuration)
                 extractor.selectTrack(i)
-                var ok = extractor.sampleTime >= 0
-                if (ok && trackDuration != null) {
-                    // Land near the end and step to it, instead of trusting one seek to hit a sample:
-                    // any sample time read in the last stretch counts, and the last one read must
-                    // be close to the track's duration.
-                    extractor.seekTo(maxOf(0L, trackDuration - TAIL_WALK_US), MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
-                    var last = extractor.sampleTime
+                // Sample times come from the index alone, and some muxers keep the index near the
+                // front, so a file whose media data is cut off still lists every sample. Read the
+                // data itself: the first sample, then everything in the last few seconds.
+                var ok = extractor.sampleTime >= 0 && readSample(extractor, scratch) >= 0
+                if (ok) {
+                    if (trackDuration != null) {
+                        extractor.seekTo(maxOf(0L, trackDuration - TAIL_WALK_US), MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+                    }
+                    var last = -1L
+                    var reads = 0
                     var steps = 0
-                    while (steps++ < MAX_TAIL_STEPS && extractor.advance()) {
+                    while (steps++ < MAX_TAIL_STEPS) {
+                        // A read of -1 before the duration is reached means the data ends early.
+                        if (readSample(extractor, scratch) < 0) break
                         val t = extractor.sampleTime
                         if (t > last) last = t
+                        reads++
+                        if (!extractor.advance()) break
                     }
-                    ok = ClipVerification.tailReached(last, trackDuration)
+                    ok = reads > 0 && ClipVerification.tailReached(last, trackDuration)
                 }
                 extractor.unselectTrack(i)
                 if (ok) withSamples++
