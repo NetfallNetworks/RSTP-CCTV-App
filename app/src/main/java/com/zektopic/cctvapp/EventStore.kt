@@ -175,7 +175,7 @@ class EventStore(
 
             for (event in events) {
                 val eventTime = event.endTimeMs ?: event.startTimeMs
-                if (eventTime < cutoff) {
+                if (eventTime < cutoff && !isPendingRebuild(event)) {
                     remove.add(event)
                 } else {
                     keep.add(event)
@@ -362,7 +362,12 @@ class EventStore(
             val events = readEventsInternal().associateBy { it.id }
             var deleted = 0
             // A rebuild killed halfway leaves its scratch file; the journal it came from is intact.
-            mediaDir.listFiles { f -> f.name.endsWith("_clip.mp4.rebuild") }?.forEach { it.delete() }
+            // Not while the clip is waiting on a rebuild (it may be that rebuild's file) or its raw
+            // data is being kept (the scratch may be the verified rebuild that could not be placed).
+            mediaDir.listFiles { f -> f.name.endsWith("_clip.mp4.rebuild") }?.forEach { scratch ->
+                val event = events[scratch.name.removeSuffix("_clip.mp4.rebuild")]
+                if (event == null || !(isPendingRebuild(event) || event.clipJournalKept)) scratch.delete()
+            }
             for (file in mediaDir.listFiles { f -> f.name.endsWith("_clip.journal") } ?: return 0) {
                 val event = events[file.name.removeSuffix("_clip.journal")]
                 val needed = event != null &&
@@ -459,9 +464,10 @@ class EventStore(
         if (events.size <= maxEvents) return events
 
         val sorted = events.sortedByDescending { it.startTimeMs }
-        val keep = sorted.take(maxEvents)
+        // A clip waiting on a rebuild holds the only copy of its data: it is not evicted.
+        val keep = sorted.take(maxEvents) + sorted.drop(maxEvents).filter { isPendingRebuild(it) }
         for (event in sorted.drop(maxEvents)) {
-            deleteMediaFor(event)
+            if (!isPendingRebuild(event)) deleteMediaFor(event)
         }
         return keep
     }
@@ -500,7 +506,7 @@ class EventStore(
         val keep = mutableListOf<DetectionEvent>()
         for (event in newestFirst) {
             val size = mediaBytesOf(event)
-            if (event.id in released) {
+            if (event.id in released || isPendingRebuild(event)) {
                 total += size
                 keep.add(event)
             } else if (full || (keep.isNotEmpty() && total + size > maxMediaBytes)) {
@@ -514,6 +520,14 @@ class EventStore(
         }
         return keep
     }
+
+    /**
+     * A recording whose clip is not attached yet and whose journal exists: being written, waiting
+     * on a rebuild, or being rebuilt. Its journal may be the only copy of the clip, so retention and
+     * the media cap leave it alone.
+     */
+    private fun isPendingRebuild(event: DetectionEvent): Boolean =
+        event.recording && event.clipFileName == null && journalFileFor(event.id).exists()
 
     private fun mediaBytesOf(event: DetectionEvent): Long =
         listOfNotNull(event.snapshotFileName, event.clipFileName)

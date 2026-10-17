@@ -79,7 +79,14 @@ class ClipSafety(
     /** Opens a clip's journal; tests substitute one that fails. */
     val journalFactory: (File, JournalHeader) -> ClipJournalWriter = { file, header -> ClipJournalWriter(file, header) },
     /** Where rebuilds run: never the encoder callback thread, never under the recorder lock. */
-    val executor: Executor = Executors.newSingleThreadExecutor { Thread(it, "clip-recovery").apply { isDaemon = true } }
+    val executor: Executor = Executors.newSingleThreadExecutor { task ->
+        // A rebuild reads and writes a whole clip: it must not compete with the encoder or the
+        // stream for the CPU, so it runs at background priority.
+        Thread({
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+            task.run()
+        }, "clip-recovery").apply { isDaemon = true }
+    }
 )
 
 /** Writes a journal back out as an MP4 with a fresh muxer, streaming so the clip is never held in memory. */
@@ -138,7 +145,12 @@ class JournalReplay(private val muxerFactory: (File) -> ClipMuxer, private val f
  * only once [ClipVerifier] passes it. Anything else leaves just the journal. The journal is
  * deleted only after a verified rebuild; every other outcome leaves it on disk.
  */
-class ClipRecovery(private val replay: JournalReplay, private val verifier: ClipVerifier) {
+class ClipRecovery(
+    private val replay: JournalReplay,
+    private val verifier: ClipVerifier,
+    /** Moves a file; replaceable so tests can make it fail. */
+    private val rename: (File, File) -> Boolean = { from, to -> from.renameTo(to) }
+) {
 
     enum class Outcome { REBUILT, REBUILT_VIDEO_ONLY, FAILED }
 
@@ -156,6 +168,24 @@ class ClipRecovery(private val replay: JournalReplay, private val verifier: Clip
 
     companion object {
         private const val TAG = "ClipRecovery"
+    }
+
+    /**
+     * Puts the verified [temp] at [target]. The existing target is only ever moved aside, never
+     * deleted first: if the move fails it is put back, so [target] is the old file or the new one.
+     */
+    private fun place(temp: File, target: File): Boolean {
+        if (rename(temp, target)) return true
+        if (!target.exists()) return false
+        val backup = File(target.parentFile, target.name + ".orig")
+        backup.delete()
+        if (!rename(target, backup)) return false
+        if (rename(temp, target)) {
+            backup.delete()
+            return true
+        }
+        rename(backup, target)
+        return false
     }
 
     /** Rebuilds [journal] into [target]; on success [target] is the verified MP4 and [journal] is gone. */
@@ -177,8 +207,13 @@ class ClipRecovery(private val replay: JournalReplay, private val verifier: Clip
                 )
                 val bad = verifier.verify(temp, expect)
                 if (bad == null) {
-                    target.delete()
-                    if (!temp.renameTo(target)) throw IOException("could not move rebuilt clip into place")
+                    if (!place(temp, target)) {
+                        // Verified, but there is nowhere to put it: keep the good scratch file and the
+                        // journal and report, rather than attach a path to a file that is not there.
+                        val why = "$step: rebuilt clip verified but could not be moved into place; kept as ${temp.name}"
+                        Log.e(TAG, why)
+                        return Result(Outcome.FAILED, scan, error = (errors + why).joinToString("; "))
+                    }
                     journal.delete()
                     Log.i(TAG, "Rebuilt ${target.name} from its journal ($step)")
                     return Result(

@@ -80,6 +80,13 @@ class ClipRecorder(
 
     companion object {
         private const val TAG = "ClipRecorder"
+
+        /**
+         * Events whose clip is being rebuilt from its journal (queued or running), process-wide so a
+         * service restarted inside the same process cannot start a second rebuild of the same
+         * journal beside the first.
+         */
+        private val rebuildsInFlight: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
         private const val AV_SKEW_LOG_INTERVAL_US = 30_000_000L
         /**
          * Ten seconds, so a clip that starts late (a slow detection pass, a busy device) still
@@ -832,12 +839,11 @@ class ClipRecorder(
         failure: ClipFailure, journal: File, target: File, clipStartMs: Long, originalDurationUs: Long,
         originalUsable: Boolean, alreadyCounted: Boolean, continued: Boolean
     ) {
-        val s = safety ?: return
         val recovery = recovery ?: return
         val originalAudio = failure.hadAudioTrack
         val originalVideoSamples = failure.videoSamples
         val originalAudioSamples = failure.audioSamples
-        s.executor.execute {
+        submitRebuild(failure.eventId) {
             val result = try {
                 recovery.recover(journal, target)
             } catch (t: Throwable) {
@@ -893,14 +899,37 @@ class ClipRecorder(
         }
     }
     /**
+     * Runs [task] on the recovery executor unless a rebuild of event [eventId] is already queued or
+     * running (a duplicate would write the same scratch file and race to delete the journal).
+     */
+    private fun submitRebuild(eventId: String, task: () -> Unit) {
+        val s = safety ?: return
+        if (!rebuildsInFlight.add(eventId)) {
+            Log.w(TAG, "A rebuild of clip $eventId is already in progress; not starting another")
+            return
+        }
+        try {
+            s.executor.execute {
+                try {
+                    task()
+                } finally {
+                    rebuildsInFlight.remove(eventId)
+                }
+            }
+        } catch (e: Exception) {
+            rebuildsInFlight.remove(eventId)
+            Log.e(TAG, "Could not schedule the rebuild of clip $eventId; its journal is kept", e)
+        }
+    }
+
+    /**
      * Rebuilds the clip an interrupted run left behind: [journal] is the only copy of it. Runs on
      * [ClipSafety.executor] and reports like a live failure would (reason [ClipFailureReason.INTERRUPTED]).
      * A journal that cannot be read is deleted; anything else it cannot rebuild stays on disk.
      */
     fun rebuildInterrupted(eventId: String, target: File, journal: File) {
-        val s = safety ?: return
         val recovery = recovery ?: return
-        s.executor.execute {
+        submitRebuild(eventId) {
             try {
                 val result = recovery.recover(journal, target)
                 val scan = result.scan

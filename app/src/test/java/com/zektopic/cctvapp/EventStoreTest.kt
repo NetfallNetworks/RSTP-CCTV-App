@@ -523,6 +523,45 @@ class EventStoreTest {
     }
 
     @Test
+    fun `a clip waiting on a rebuild is not expired, evicted or dropped by the media cap`() {
+        val eventStore = EventStore(tempFolder.root, retentionMs = 1_000L, maxEvents = 1, maxMediaBytes = 3_000L)
+        val pending = eventStore.createDetectionEvent("person", 0.9, jpeg, recording = true)
+        journalOf(eventStore, pending.id, bytes = 5_000)
+        val plain = eventStore.createDetectionEvent("motion", 0.1, jpeg, recording = true)
+        Thread.sleep(3)
+        val newest = part(eventStore, clipBytes = 1_000)
+
+        attach(eventStore, newest, held = false)   // media cap, max events
+        eventStore.cleanupExpired(nowMs = System.currentTimeMillis() + 10_000_000L)
+
+        assertNotNull("the pending clip survives the cap, the event limit and retention", eventStore.getEvent(pending.id))
+        assertTrue(eventStore.journalFileFor(pending.id).exists())
+        assertNull("an ordinary old event does not", eventStore.getEvent(plain.id))
+    }
+
+    @Test
+    fun `a rebuild scratch file is swept only when nothing could still need it`() {
+        val eventStore = store()
+        val pending = eventStore.createDetectionEvent("person", 0.9, jpeg, recording = true)
+        val kept = eventStore.createDetectionEvent("person", 0.9, jpeg, recording = true)
+        val done = eventStore.createDetectionEvent("person", 0.9, jpeg, recording = true)
+        for (e in listOf(pending, kept)) journalOf(eventStore, e.id)
+        eventStore.recordClipFailure(kept.id, finaliseError, journalKept = true)
+        eventStore.clearRecording(kept.id)
+        eventStore.clipFileFor(done.id).writeBytes(ByteArray(10))
+        attach(eventStore, done, held = false)
+        fun scratch(id: String) = File(eventStore.clipFileFor(id).parentFile, "${id}_clip.mp4.rebuild")
+        for (id in listOf(pending.id, kept.id, done.id, "gone")) scratch(id).writeBytes(ByteArray(3))
+
+        eventStore.deleteOrphanJournals()
+
+        assertTrue(scratch(pending.id).exists())
+        assertTrue(scratch(kept.id).exists())
+        assertFalse(scratch(done.id).exists())
+        assertFalse(scratch("gone").exists())
+    }
+
+    @Test
     fun `a journal is deleted with its event however the event goes`() {
         val eventStore = store()
         val a = eventStore.createDetectionEvent("person", 0.9, jpeg, recording = true)

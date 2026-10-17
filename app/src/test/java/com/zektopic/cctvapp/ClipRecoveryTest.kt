@@ -38,10 +38,14 @@ class ClipRecoveryTest {
 
     private class Rig(val recovery: ClipRecovery, val muxers: MutableList<FakeMuxer>, val verifier: FakeVerifier)
 
-    private fun rig(verifier: FakeVerifier = FakeVerifier(), configure: (Int, FakeMuxer) -> Unit = { _, _ -> }): Rig {
+    private fun rig(
+        verifier: FakeVerifier = FakeVerifier(),
+        rename: (File, File) -> Boolean = { a, b -> a.renameTo(b) },
+        configure: (Int, FakeMuxer) -> Unit = { _, _ -> }
+    ): Rig {
         val muxers = mutableListOf<FakeMuxer>()
         val replay = JournalReplay({ f -> FakeMuxer(f).also { configure(muxers.size, it); muxers.add(it) } }, FakeFormats())
-        return Rig(ClipRecovery(replay, verifier), muxers, verifier)
+        return Rig(ClipRecovery(replay, verifier, rename), muxers, verifier)
     }
 
     // --- the verification rule ---
@@ -137,7 +141,7 @@ class ClipRecoveryTest {
     @Test
     fun `if the full rebuild cannot be finalised the second step is video only`() {
         writeJournal()
-        val r = rig { index, m -> if (index == 0) m.failStop = IllegalStateException("Failed to stop the muxer") }
+        val r = rig(configure = { index, m -> if (index == 0) m.failStop = IllegalStateException("Failed to stop the muxer") })
 
         val result = r.recovery.recover(journal(), target())
 
@@ -185,9 +189,52 @@ class ClipRecoveryTest {
     }
 
     @Test
+    fun `a verified rebuild that cannot be moved into place is kept, nothing is deleted, and it is reported`() {
+        writeJournal()
+        target().writeText("the broken original")
+        val r = rig(rename = { _, _ -> false })
+
+        val result = r.recovery.recover(journal(), target())
+
+        assertEquals(ClipRecovery.Outcome.FAILED, result.outcome)
+        assertTrue(result.error!!.contains("could not be moved into place"))
+        assertEquals("the target is untouched", "the broken original", target().readText())
+        assertTrue("the verified rebuild is kept", scratch().exists())
+        assertTrue("and so is the journal", journal().exists())
+        assertEquals("no further rung is tried", 1, r.muxers.size)
+    }
+
+    @Test
+    fun `a target that blocks the rename is moved aside, replaced, and restored if that fails`() {
+        // A filesystem that will not rename over an existing file (as Windows does not).
+        val noOverwrite = { from: File, to: File -> if (to.exists()) false else from.renameTo(to) }
+        writeJournal()
+        target().writeText("the broken original")
+        val ok = rig(rename = noOverwrite)
+
+        assertEquals(ClipRecovery.Outcome.REBUILT, ok.recovery.recover(journal(), target()).outcome)
+        assertEquals("mp4", target().readText())
+        assertFalse(File(tempFolder.root, "e1_clip.mp4.orig").exists())
+
+        writeJournal()
+        target().writeText("the broken original")
+        var calls = 0
+        // The first rename (temp over target) and the one into place after the backup both fail.
+        val failsIntoPlace = { from: File, to: File ->
+            calls++
+            if (from.name.endsWith(".rebuild")) false else from.renameTo(to)
+        }
+        val bad = rig(rename = failsIntoPlace)
+
+        assertEquals(ClipRecovery.Outcome.FAILED, bad.recovery.recover(journal(), target()).outcome)
+        assertEquals("the original is back", "the broken original", target().readText())
+        assertTrue(journal().exists())
+    }
+
+    @Test
     fun `a muxer that fails at every step leaves the journal and no scratch file`() {
         writeJournal()
-        val r = rig { _, m -> m.failStart = java.io.IOException("open failed") }
+        val r = rig(configure = { _, m -> m.failStart = java.io.IOException("open failed") })
 
         val result = r.recovery.recover(journal(), target())
 

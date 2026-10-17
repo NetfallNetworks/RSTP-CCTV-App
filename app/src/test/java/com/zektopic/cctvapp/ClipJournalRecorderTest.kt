@@ -48,6 +48,7 @@ class ClipJournalRecorderTest {
         targetDir: File = tempFolder.root,
         maxClipUs: Long = ClipRecorder.DEFAULT_MAX_CLIP_US,
         formats: FakeFormats = FakeFormats(),
+        executor: Executor = Executor { it.run() },
         journalFactory: (File, JournalHeader) -> ClipJournalWriter = { f, h -> ClipJournalWriter(f, h) },
         configure: (Int, FakeMuxer) -> Unit = { _, _ -> }
     ): Rig {
@@ -63,7 +64,7 @@ class ClipJournalRecorderTest {
             onRollover = { newTarget() },
             onClipFailed = { failures.add(it) },
             muxerFactory = { f -> FakeMuxer(f).also { configure(muxers.size, it); muxers.add(it) } },
-            safety = ClipSafety(formats, verifier, journalFactory, Executor { it.run() }),
+            safety = ClipSafety(formats, verifier, journalFactory, executor),
             onNoJournal = { id, reason -> noJournalNotes.add(id to reason) }
         )
         noJournalNotes.clear()
@@ -456,6 +457,42 @@ class ClipJournalRecorderTest {
         assertTrue(target.exists())
         assertFalse(journal.exists())
         assertEquals(1L, r.recorder.stats().clipsRecovered)
+    }
+
+    @Test
+    fun `a second rebuild of the same event is not started while the first is queued or running`() {
+        val queued = mutableListOf<Runnable>()
+        val r = rig(executor = Executor { queued.add(it) })
+        val journal = orphanJournal()
+        val target = File(tempFolder.root, "orphan_clip.mp4")
+
+        r.recorder.rebuildInterrupted("orphan-dup", target, journal)
+        r.recorder.rebuildInterrupted("orphan-dup", target, journal) // e.g. the service restarted in this process
+        assertEquals("one rebuild queued, the duplicate refused", 1, queued.size)
+
+        queued.removeAt(0).run()
+        assertEquals(1, r.finished.size)
+        assertEquals(1L, r.recorder.stats().clipsRecovered)
+
+        // Once it has finished the event may be rebuilt again (a new orphan journal, say).
+        val again = orphanJournal()
+        r.recorder.rebuildInterrupted("orphan-dup", target, again)
+        assertEquals(1, queued.size)
+        queued.removeAt(0).run()
+        assertEquals(2, r.finished.size)
+    }
+
+    @Test
+    fun `a rebuild that cannot be scheduled does not wedge the event`() {
+        val r = rig(executor = Executor { throw java.util.concurrent.RejectedExecutionException("shut down") })
+        val journal = orphanJournal()
+
+        r.recorder.rebuildInterrupted("orphan-rej", File(tempFolder.root, "orphan_clip.mp4"), journal)
+
+        assertTrue("the journal is untouched", journal.exists())
+        val ok = rig()
+        ok.recorder.rebuildInterrupted("orphan-rej", File(tempFolder.root, "orphan_clip.mp4"), journal)
+        assertEquals("a later attempt is allowed", 1, ok.finished.size)
     }
 
     @Test
