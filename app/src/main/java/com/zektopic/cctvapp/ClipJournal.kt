@@ -10,6 +10,8 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
+import java.nio.ByteBuffer
+import java.util.zip.CRC32
 
 /*
  * A crash-safe record of every sample a clip writes.
@@ -62,7 +64,10 @@ class JournalScan(
 /** `<eventId>_clip.mp4` is journaled in `<eventId>_clip.journal`, in the same directory. */
 fun journalFileFor(clipFile: File): File = File(clipFile.parentFile, clipFile.nameWithoutExtension + ".journal")
 
-private const val MAGIC = 0x434A3031 // "CJ01"
+/** "CJ02": version 2 added a CRC32 after every record. Version 1 journals are refused. */
+private const val MAGIC = 0x434A3032
+/** type (1) + ptsUs (8) + flags (1) + length (4): the part of a record the CRC covers before the payload. */
+private const val RECORD_HEAD_BYTES = 14
 private const val TYPE_VIDEO = 1
 private const val TYPE_AUDIO = 2
 private const val FLAG_KEY = 1
@@ -122,11 +127,18 @@ open class ClipJournalWriter(
 
     @Synchronized
     open fun append(isVideo: Boolean, ptsUs: Long, keyFrame: Boolean, data: ByteArray) {
-        out.writeByte(if (isVideo) TYPE_VIDEO else TYPE_AUDIO)
-        out.writeLong(ptsUs)
-        out.writeByte(if (keyFrame) FLAG_KEY else 0)
-        out.writeInt(data.size)
+        val head = ByteBuffer.allocate(RECORD_HEAD_BYTES)
+            .put((if (isVideo) TYPE_VIDEO else TYPE_AUDIO).toByte())
+            .putLong(ptsUs)
+            .put((if (keyFrame) FLAG_KEY else 0).toByte())
+            .putInt(data.size)
+            .array()
+        // The CRC covers the whole record, so what a power cut leaves behind (a torn or
+        // zero-filled tail, garbage where a record should be) is never replayed as a sample.
+        val crc = CRC32().apply { update(head); update(data) }
+        out.write(head)
         out.write(data)
+        out.writeInt(crc.value.toInt())
         if (isVideo) videoSamples++ else audioSamples++
         if (ptsUs < firstPtsUs) firstPtsUs = ptsUs
         if (ptsUs > lastPtsUs) lastPtsUs = ptsUs
@@ -245,22 +257,36 @@ class ClipJournalReader private constructor(
         }
     }
 
-    /** The next sample, or null at the end of the journal (or at a torn record). */
+    private var ended = false
+
+    private fun stop(): JournalSample? {
+        ended = true
+        return null
+    }
+
+    /** The next sample, or null at the end of the journal, at a torn record, or at the first record that fails its CRC. */
     fun next(): JournalSample? {
+        if (ended) return null
         try {
-            val type = input.readUnsignedByte()
-            if (type != TYPE_VIDEO && type != TYPE_AUDIO) return null // zero fill or garbage
-            val ptsUs = input.readLong()
-            val flags = input.readUnsignedByte()
-            val length = input.readInt()
-            if (length < 0 || length > MAX_SAMPLE_BYTES) return null
+            val head = ByteArray(RECORD_HEAD_BYTES)
+            input.readFully(head)
+            val h = ByteBuffer.wrap(head)
+            val type = h.get().toInt() and 0xFF
+            if (type != TYPE_VIDEO && type != TYPE_AUDIO) return stop() // zero fill or garbage
+            val ptsUs = h.getLong()
+            val flags = h.get().toInt() and 0xFF
+            val length = h.getInt()
+            if (length < 0 || length > MAX_SAMPLE_BYTES) return stop()
             val data = ByteArray(length)
             input.readFully(data)
+            val stored = input.readInt()
+            val crc = CRC32().apply { update(head); update(data) }
+            if (crc.value.toInt() != stored) return stop() // damaged record: nothing after it can be trusted
             return JournalSample(type == TYPE_VIDEO, ptsUs, flags and FLAG_KEY != 0, data)
         } catch (_: EOFException) {
-            return null
+            return stop()
         } catch (_: IOException) {
-            return null
+            return stop()
         }
     }
 

@@ -106,9 +106,48 @@ class ClipJournalTest {
         for (cut in 1..20) {
             file.writeBytes(full.copyOf(full.size - cut))
             val samples = readAll(file)
-            assertTrue("cut $cut left ${samples.size}", samples.size in 8..9)
+            assertEquals("cut $cut", 9, samples.size)
             assertEquals(samples.indices.map { it * 33_333L }, samples.map { it.ptsUs })
         }
+    }
+
+    /** Bytes per record in these tests: 14 head + 3 payload + 4 CRC. */
+    private val recordBytes = 21
+
+    @Test
+    fun `a damaged record in the middle ends the stream there, whatever field was hit`() {
+        val file = write(JournalHeader(1L, video, audio), (0 until 10).map { Triple(true, it * 33_333L, it == 0) })
+        val original = file.readBytes()
+        // Record 4 (the fifth): flip a payload byte, then a pts byte, then a length byte, then the CRC itself.
+        for (offsetInRecord in listOf(15, 3, 11, 19)) {
+            val bytes = original.copyOf()
+            val start = bytes.size - (10 - 4) * recordBytes
+            bytes[start + offsetInRecord] = (bytes[start + offsetInRecord].toInt() xor 0x40).toByte()
+            file.writeBytes(bytes)
+
+            val samples = readAll(file)
+            assertEquals("offset $offsetInRecord", 4, samples.size)
+            assertEquals(samples.indices.map { it * 33_333L }, samples.map { it.ptsUs })
+        }
+    }
+
+    @Test
+    fun `a record that is only partly overwritten by garbage after power loss is not replayed`() {
+        val file = write(JournalHeader(1L, video, null), (0 until 3).map { Triple(true, it * 33_333L, it == 0) })
+        // A full-looking record with the right type byte and a plausible length but wrong contents.
+        file.appendBytes(byteArrayOf(1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 3, 9, 9, 9, 1, 2, 3, 4))
+        assertEquals(3, readAll(file).size)
+    }
+
+    @Test
+    fun `a journal in the old format without checksums is refused`() {
+        val file = write(JournalHeader(1L, video, null), listOf(Triple(true, 0L, true)))
+        val bytes = file.readBytes()
+        // "CJ01" instead of "CJ02"
+        bytes[3] = 0x31
+        file.writeBytes(bytes)
+        assertNull(ClipJournalReader.open(file))
+        assertNull(ClipJournalReader.scan(file))
     }
 
     @Test
