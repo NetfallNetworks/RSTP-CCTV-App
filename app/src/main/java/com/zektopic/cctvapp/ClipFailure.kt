@@ -9,7 +9,14 @@ enum class ClipFailureReason {
     /** A sample write threw mid-clip. */
     WRITE_FAILED,
     /** The per-file cap was reached, the previous part was kept, and no continuation could be opened. */
-    ROLLOVER_DECLINED
+    ROLLOVER_DECLINED,
+    /** The process or device stopped mid-clip; found at the next start from the journal it left. */
+    INTERRUPTED,
+    /**
+     * The file finalised but the verifier disagreed, and so did a rebuild from the journal. The
+     * clip was kept as it is: not a loss, but not vouched for either.
+     */
+    UNVERIFIED
 }
 
 /**
@@ -28,8 +35,21 @@ class ClipFailure(
     val hadAudioTrack: Boolean,
     val videoSamples: Int,
     val audioSamples: Int,
-    val atMs: Long = System.currentTimeMillis()
+    val atMs: Long = System.currentTimeMillis(),
+    /** The clip could not be rebuilt either, and its journal (the raw data) was left on disk. */
+    val journalKept: Boolean = false,
+    /**
+     * The lost clip was a part of a recording that carries on in a continuation part (it hit the
+     * per-file cap), so the recording has not ended and its earlier parts stay held.
+     */
+    val continued: Boolean = false
 ) {
+    /** The same failure, now known to have ended with only the journal left. */
+    fun withJournalKept() = ClipFailure(
+        eventId, reason, message, recordedMs, hadAudioTrack, videoSamples, audioSamples, atMs,
+        journalKept = true, continued = continued
+    )
+
     fun toClipError() = ClipError(
         reason = reason.name, detail = message, recordedMs = recordedMs,
         audioTrack = hadAudioTrack, videoSamples = videoSamples, audioSamples = audioSamples
@@ -54,6 +74,15 @@ class ClipFailure(
     }
 }
 
+/**
+ * The safety net failing quietly would be worse than not having one: a clip that could not be
+ * journaled (kind "open") or whose journal stopped short (kind "write") is counted and kept here.
+ */
+class JournalProblem(val atMs: Long, val eventId: String, val kind: String, val reason: String) {
+    fun toJson(): String = org.json.JSONObject()
+        .put("atMs", atMs).put("eventId", eventId).put("kind", kind).put("reason", reason).toString()
+}
+
 /** Counters and the last loss, for /status. Counts every clip part, not every visit. */
 class ClipStats(
     /** Parts opened successfully, including rollover continuations. */
@@ -64,10 +93,27 @@ class ClipStats(
     val clipFailures: Long = 0,
     val lastFailure: ClipFailure? = null,
     /** Longest time one clip start held the recorder's lock, ms; the stall encoder callbacks saw. */
-    val maxStartHoldMs: Long = 0
+    val maxStartHoldMs: Long = 0,
+    /** Failed clips that were then rebuilt from their journal and kept (also counted in [clipFailures]). */
+    val clipsRecovered: Long = 0,
+    /** Clips kept as they finalised although verification (and a rebuild) disagreed; see [ClipFailureReason.UNVERIFIED]. */
+    val clipsUnverified: Long = 0,
+    /** Clips recorded with no journal because it could not be opened (or its header built). */
+    val journalOpenFailures: Long = 0,
+    /** Clips whose journal stopped short because a write to it failed. */
+    val journalWriteFailures: Long = 0,
+    val lastJournalProblem: JournalProblem? = null,
+    /** Longest time verifying a finished MP4 held the recorder's lock, ms (it runs on the encoder thread). */
+    val maxVerifyHoldMs: Long = 0,
+    /** Longest time ending a file at the cap and opening its continuation held the lock, ms. */
+    val maxRolloverHoldMs: Long = 0
 ) {
     /** The /status keys, without surrounding braces, ready to splice into its object. */
     fun toJsonFields(): String =
         "\"clipsStarted\":$clipsStarted,\"clipsFinalised\":$clipsFinalised,\"clipFailures\":$clipFailures," +
-            "\"clipStartMaxHoldMs\":$maxStartHoldMs,\"lastClipFailure\":${lastFailure?.toJson() ?: "null"}"
+            "\"clipsRecovered\":$clipsRecovered,\"clipsUnverified\":$clipsUnverified," +
+            "\"journalOpenFailures\":$journalOpenFailures,\"journalWriteFailures\":$journalWriteFailures," +
+            "\"lastJournalProblem\":${lastJournalProblem?.toJson() ?: "null"}," +
+            "\"clipStartMaxHoldMs\":$maxStartHoldMs,\"verifyMaxHoldMs\":$maxVerifyHoldMs," +
+            "\"rolloverMaxHoldMs\":$maxRolloverHoldMs,\"lastClipFailure\":${lastFailure?.toJson() ?: "null"}"
 }

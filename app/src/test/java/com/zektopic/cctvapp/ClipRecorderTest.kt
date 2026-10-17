@@ -18,48 +18,6 @@ import java.nio.ByteBuffer
  */
 class ClipRecorderTest {
 
-    private class FakeMuxer : ClipMuxer {
-        class Sample(val track: Int, val absPtsUs: Long, val relPtsUs: Long, val key: Boolean)
-
-        val tracks = mutableListOf<MediaFormat>()
-        val samples = mutableListOf<Sample>()
-        var started = false
-        var stopped = false
-        var failStart: Exception? = null
-        var failStop: Exception? = null
-        /** The write that would be sample number N (0-based) throws. */
-        var failWriteAt = -1
-
-        override fun addTrack(format: MediaFormat): Int {
-            tracks.add(format)
-            return tracks.size - 1
-        }
-
-        override fun start() {
-            failStart?.let { throw it }
-            started = true
-        }
-
-        override fun writeSample(track: Int, data: ByteArray, ptsUs: Long, keyFrame: Boolean) {
-            if (samples.size == failWriteAt) throw IOException("No space left on device")
-            // The frame's own absolute pts rides in its payload, so a test can see which
-            // source frames a clip holds whatever its timeline is anchored at.
-            samples.add(Sample(track, ByteBuffer.wrap(data).long, ptsUs, keyFrame))
-        }
-
-        override fun stop() {
-            failStop?.let { throw it }
-            if (tracks.indices.any { t -> samples.none { it.track == t } }) {
-                throw IllegalStateException("Failed to stop the muxer")
-            }
-            stopped = true
-        }
-
-        override fun release() {}
-
-        fun video() = samples.filter { it.track == 0 }
-        fun audio() = samples.filter { it.track == 1 }
-    }
 
     private val frameUs = 33_333L
     private val gopFrames = 30
@@ -202,6 +160,50 @@ class ClipRecorderTest {
         assertEquals("the partial clip is kept", 1, r.finished.size)
         assertTrue(r.failures.isEmpty())
         assertEquals(0L, r.recorder.stats().clipFailures)
+    }
+
+    @Test
+    fun `a file that cannot be finalised at the cap still continues the recording in a new part`() {
+        var opened = 0
+        val r = rig(maxClipUs = 20_000_000L) { m ->
+            if (opened++ == 0) m.failStop = IllegalStateException("Failed to stop the muxer")
+        }
+        advance(r, 6.0)
+        trigger(r)
+        var seconds = 0
+        while (r.muxers.size < 2 && seconds++ < 60) { advance(r, 1.0); trigger(r) }
+
+        val lost = r.failures.single()
+        assertEquals("event-0", lost.eventId)
+        assertEquals(ClipFailureReason.FINALISE_FAILED, lost.reason)
+        assertTrue("the recording goes on after this part", lost.continued)
+        assertEquals("a continuation part is open", "event-1", r.recorder.activeEventId)
+        assertEquals(2, r.muxers.size)
+        assertEquals(1L, r.recorder.stats().clipFailures)
+    }
+
+    @Test
+    fun `when the continuation of a lost part is declined the recording is reported ended once more`() {
+        var opened = 0
+        val r = rig(maxClipUs = 20_000_000L) { m ->
+            if (opened++ == 0) m.failStop = IllegalStateException("Failed to stop the muxer")
+        }
+        advance(r, 6.0)
+        trigger(r)
+        declineRollover = true
+        try {
+            var seconds = 0
+            while (r.failures.size < 2 && seconds++ < 60) { advance(r, 1.0); trigger(r) }
+        } finally {
+            declineRollover = false
+        }
+
+        assertEquals(2, r.failures.size)
+        assertTrue(r.failures[0].continued)
+        assertEquals(ClipFailureReason.ROLLOVER_DECLINED, r.failures[1].reason)
+        assertEquals("event-0", r.failures[1].eventId)
+        assertFalse("this one ends the recording", r.failures[1].continued)
+        assertEquals("the same clip is not counted twice", 1L, r.recorder.stats().clipFailures)
     }
 
     @Test

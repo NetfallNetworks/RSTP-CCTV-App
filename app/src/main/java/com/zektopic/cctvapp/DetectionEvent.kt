@@ -46,7 +46,14 @@ data class DetectionEvent(
      * Why this event's clip is missing or cut short, when [ClipRecorder] lost it. Null on every
      * event that recorded normally, and on events written before this was kept.
      */
-    val clipError: ClipError? = null
+    val clipError: ClipError? = null,
+    /** The clip failed to finalise cleanly and was rebuilt from its journal; [clipError] is why. */
+    val clipRecovered: Boolean = false,
+    /**
+     * The raw data of a clip that could not be finalised or rebuilt is kept in its journal
+     * (`<id>_clip.journal`). Such an event is never archived, which would delete it.
+     */
+    val clipJournalKept: Boolean = false
 ) {
     companion object {
         /** Most specific first; an event's [type] is the highest of its tags. */
@@ -81,7 +88,9 @@ data class DetectionEvent(
                     audioTrack = obj.optBoolean("clip_error_audio", false),
                     videoSamples = obj.optInt("clip_error_video_samples", 0),
                     audioSamples = obj.optInt("clip_error_audio_samples", 0)
-                ) else null
+                ) else null,
+                clipRecovered = obj.optBoolean("clip_recovered", false),
+                clipJournalKept = obj.optBoolean("clip_journal_kept", false)
             )
         }
     }
@@ -123,8 +132,14 @@ data class DetectionEvent(
             obj.put("clip_error_video_samples", clipError.videoSamples)
             obj.put("clip_error_audio_samples", clipError.audioSamples)
             // Derived, for the /clips page; not read back.
-            obj.put("clip_error_summary", clipError.summary())
+            obj.put("clip_error_summary", when {
+                clipRecovered -> "recovered from journal after ${clipError.summary()}"
+                clipJournalKept -> "clip damaged, raw data kept (${clipError.summary()})"
+                else -> clipError.summary()
+            })
         }
+        if (clipRecovered) obj.put("clip_recovered", true)
+        if (clipJournalKept) obj.put("clip_journal_kept", true)
         obj.put("created_at", createdAtMs)
         return obj
     }
@@ -144,6 +159,8 @@ data class ClipError(
 ) {
     /** For example "finalise failed after 9m12s (audio track, 0 audio samples, 16000 video samples)". */
     fun summary(): String {
+        if (reason == "NO_JOURNAL") return "recorded without a journal: ${detail ?: "unknown reason"}"
+        if (reason == "UNVERIFIED") return "kept without verification (${detail ?: "no detail"})"
         val what = reason.lowercase().replace('_', ' ')
         val after = if (recordedMs > 0) " after ${formatDuration(recordedMs)}" else ""
         val tracks = if (audioTrack) "audio track, $audioSamples audio samples" else "no audio track"
