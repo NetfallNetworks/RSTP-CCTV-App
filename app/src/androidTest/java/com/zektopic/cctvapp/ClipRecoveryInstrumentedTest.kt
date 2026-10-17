@@ -4,27 +4,43 @@ import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.os.SystemClock
+import android.util.Log
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
+import java.nio.ByteBuffer
+import java.util.concurrent.Executor
 
 /**
- * The real-muxer half of clip recovery, which the JVM tests can only fake: encode a second of
- * H.264 with the device's own encoder, journal it, rebuild an MP4 from the journal with a real
- * MediaMuxer, and check the real MediaExtractor-based verifier accepts it and rejects junk.
+ * The real-muxer half of clip recovery, which the JVM tests can only fake: encode video and audio
+ * with the device's own encoders, journal them, rebuild MP4s from the journals with a real
+ * MediaMuxer, and check the real MediaExtractor-based verifier accepts good files and rejects
+ * damaged ones. Also stages the crash-orphan case end to end against a temporary EventStore.
+ * Everything lives under the app's cacheDir; the real media directory is never touched.
  *
- * Needs a device with an H.264 encoder. NOT run in CI (CI only compiles instrumented tests).
+ * Needs a device with H.264 and AAC encoders. NOT run in CI (CI only compiles instrumented tests).
+ *
+ * WARNING, if you run this on frankie: `am instrument` force-stops the app, and START_STICKY does
+ * NOT restart a force-stopped package, so the camera stream stays down until the app is started
+ * again with
+ *
+ *     am start -n com.zektopic.cctvapp/.MainActivity -a com.zektopic.cctvapp.ACTION_START_SERVER_FROM_BOOT -f 0x14000000
  */
 @RunWith(AndroidJUnit4::class)
 class ClipRecoveryInstrumentedTest {
+
+    companion object {
+        private const val TAG = "ClipRecoveryIT"
+    }
 
     private lateinit var dir: File
 
@@ -39,17 +55,19 @@ class ClipRecoveryInstrumentedTest {
         dir.deleteRecursively()
     }
 
-    private class Encoded(val format: MediaFormat, val samples: List<Triple<ByteArray, Long, Boolean>>)
+    private class Encoded(val format: MediaFormat, val samples: List<Triple<ByteArray, Long, Boolean>>) {
+        val payloadBytes: Long get() = samples.sumOf { it.first.size.toLong() }
+        val spanUs: Long get() = samples.last().second - samples.first().second
+    }
 
-    /** Encodes 60 flat frames (30 fps, a keyframe each second) and returns the encoder's output. */
-    private fun encode(): Encoded {
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, 320, 240).apply {
-            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
-            setInteger(MediaFormat.KEY_BIT_RATE, 500_000)
-            setInteger(MediaFormat.KEY_FRAME_RATE, 30)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-        }
-        val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+    /**
+     * Feeds [frames] buffers (filled by [fill], which returns the byte count) to an encoder for
+     * [mime] and returns what it produced, without the codec-config buffer.
+     */
+    private fun encode(
+        mime: String, format: MediaFormat, frames: Int, ptsOf: (Int) -> Long, fill: (ByteBuffer, Int) -> Int
+    ): Encoded {
+        val codec = MediaCodec.createEncoderByType(mime)
         codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         codec.start()
         val info = MediaCodec.BufferInfo()
@@ -60,18 +78,16 @@ class ClipRecoveryInstrumentedTest {
         val deadline = SystemClock.elapsedRealtime() + 30_000
         try {
             while (!done && SystemClock.elapsedRealtime() < deadline) {
-                if (queued <= 60) {
+                if (queued <= frames) {
                     val i = codec.dequeueInputBuffer(10_000)
                     if (i >= 0) {
-                        val pts = queued * 33_333L
-                        if (queued == 60) {
-                            codec.queueInputBuffer(i, 0, 0, pts, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                        if (queued == frames) {
+                            codec.queueInputBuffer(i, 0, 0, ptsOf(queued), MediaCodec.BUFFER_FLAG_END_OF_STREAM)
                         } else {
                             val buffer = codec.getInputBuffer(i)!!
                             buffer.clear()
-                            val size = 320 * 240 * 3 / 2
-                            buffer.put(ByteArray(size) { (queued * 4).toByte() })
-                            codec.queueInputBuffer(i, 0, size, pts, 0)
+                            val size = fill(buffer, queued)
+                            codec.queueInputBuffer(i, 0, size, ptsOf(queued), 0)
                         }
                         queued++
                     }
@@ -95,56 +111,240 @@ class ClipRecoveryInstrumentedTest {
             codec.stop()
             codec.release()
         }
-        assertTrue("encoder produced frames", samples.size > 30)
+        assertTrue("$mime encoder produced output", samples.size > 10)
         return Encoded(outFormat!!, samples)
     }
 
-    private fun journalOf(encoded: Encoded): File {
+    /** Sixty flat frames, 30 fps, a keyframe each second. */
+    private fun encodeVideo(): Encoded {
+        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, 320, 240).apply {
+            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
+            setInteger(MediaFormat.KEY_BIT_RATE, 500_000)
+            setInteger(MediaFormat.KEY_FRAME_RATE, 30)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+        }
+        val size = 320 * 240 * 3 / 2
+        return encode(MediaFormat.MIMETYPE_VIDEO_AVC, format, 60, { it * 33_333L }) { buffer, n ->
+            buffer.put(ByteArray(size) { (n * 4).toByte() })
+            size
+        }
+    }
+
+    /** About two seconds of silence, 48 kHz mono AAC-LC. */
+    private fun encodeAudio(): Encoded {
+        val format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, 48_000, 1).apply {
+            setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
+            setInteger(MediaFormat.KEY_BIT_RATE, 64_000)
+        }
+        return encode(MediaFormat.MIMETYPE_AUDIO_AAC, format, 100, { it * 1024L * 1_000_000L / 48_000L }) { buffer, _ ->
+            val size = minOf(2048, buffer.remaining())
+            buffer.put(ByteArray(size))
+            size
+        }
+    }
+
+    private fun recovery(verifier: ClipVerifier = MediaExtractorVerifier()) = ClipRecovery(
+        JournalReplay({ Mp4ClipMuxer(it.path) }, AndroidClipFormats()), verifier
+    )
+
+    private fun journalOf(video: Encoded, audio: Encoded? = null, name: String = "e1_clip.journal"): File {
         val formats = AndroidClipFormats()
-        val file = File(dir, "e1_clip.journal")
-        val writer = ClipJournalWriter(file, JournalHeader(1L, formats.videoInfo(encoded.format), null))
-        for ((data, pts, key) in encoded.samples) writer.append(true, pts, key, data)
+        val file = File(dir, name)
+        val header = JournalHeader(1L, formats.videoInfo(video.format), audio?.let { formats.audioInfo(it.format) })
+        val writer = ClipJournalWriter(file, header)
+        // Interleave by time, as the recorder would see them.
+        val all = video.samples.map { Triple(true, it, it.second) } + (audio?.samples ?: emptyList()).map { Triple(false, it, it.second) }
+        for ((isVideo, sample, _) in all.sortedBy { it.third }) writer.append(isVideo, sample.second, sample.third, sample.first)
         writer.close()
         return file
     }
 
+    /** A rebuilt, verified video-only MP4 plus what the verifier is told to expect of it. */
+    private fun goodMp4(video: Encoded): Pair<File, ClipExpectation> {
+        val target = File(dir, "good.mp4")
+        val result = recovery().recover(journalOf(video, name = "good.journal"), target)
+        assertEquals(result.error, ClipRecovery.Outcome.REBUILT_VIDEO_ONLY, result.outcome)
+        return target to ClipExpectation(1, video.spanUs, video.payloadBytes)
+    }
+
+    // --- the rebuild and the verifier ---
+
     @Test
     fun journalIsRebuiltIntoAnMp4TheRealVerifierAccepts() {
-        val encoded = encode()
-        val journal = journalOf(encoded)
+        val video = encodeVideo()
+        val journal = journalOf(video)
         val target = File(dir, "e1_clip.mp4")
-        val recovery = ClipRecovery(
-            JournalReplay({ Mp4ClipMuxer(it.path) }, AndroidClipFormats()),
-            MediaExtractorVerifier()
-        )
 
-        val result = recovery.recover(journal, target)
+        val result = recovery().recover(journal, target)
 
         assertEquals(result.error, ClipRecovery.Outcome.REBUILT_VIDEO_ONLY, result.outcome)
-        assertEquals(encoded.samples.size, result.videoSamples)
-        assertTrue(target.length() > 0)
+        assertEquals(video.samples.size, result.videoSamples)
+        assertEquals(video.payloadBytes, result.payloadBytes)
+        assertTrue(target.length() >= video.payloadBytes)
         assertFalse("verified, so the journal is deleted", journal.exists())
-        val span = encoded.samples.last().second - encoded.samples.first().second
-        assertEquals(null, MediaExtractorVerifier().verify(target, ClipExpectation(1, span)))
+        assertNull(MediaExtractorVerifier().verify(target, ClipExpectation(1, video.spanUs, video.payloadBytes)))
     }
 
     @Test
-    fun theVerifierRejectsAFileThatIsNotAnMp4AndATruncatedOne() {
-        val encoded = encode()
-        val journal = journalOf(encoded)
+    fun aJournalWithAudioIsReplayedIntoAnMp4WithTwoVerifiedTracks() {
+        val video = encodeVideo()
+        val audio = encodeAudio()
+        val journal = journalOf(video, audio)
         val target = File(dir, "e1_clip.mp4")
-        ClipRecovery(JournalReplay({ Mp4ClipMuxer(it.path) }, AndroidClipFormats()), MediaExtractorVerifier())
-            .recover(journal, target)
-        val span = encoded.samples.last().second - encoded.samples.first().second
+
+        val result = recovery().recover(journal, target)
+
+        assertEquals(result.error, ClipRecovery.Outcome.REBUILT, result.outcome)
+        assertTrue(result.hadAudioTrack)
+        assertEquals(audio.samples.size, result.audioSamples)
+        assertFalse(journal.exists())
+        val span = maxOf(video.samples.last().second, audio.samples.last().second) - minOf(video.samples.first().second, audio.samples.first().second)
+        assertNull(
+            "both tracks are there, yield data, and reach the end",
+            MediaExtractorVerifier().verify(target, ClipExpectation(2, span, video.payloadBytes + audio.payloadBytes))
+        )
+        assertNotNull("and claiming one track is wrong", MediaExtractorVerifier().verify(target, ClipExpectation(1, span)))
+    }
+
+    @Test
+    fun theVerifierRejectsDamagedFilesAndAcceptsTheGoodOne() {
+        val video = encodeVideo()
+        val (good, expect) = goodMp4(video)
         val verifier = MediaExtractorVerifier()
+        val bytes = good.readBytes()
+        fun variant(name: String, content: ByteArray) = File(dir, name).also { it.writeBytes(content) }
 
-        val junk = File(dir, "junk.mp4").also { it.writeBytes(ByteArray(2_000) { 5 }) }
-        assertNotNull(verifier.verify(junk, ClipExpectation(1, span)))
+        assertNull("positive control: the untouched file passes", verifier.verify(good, expect))
 
-        // A muxer killed before stop() leaves the media data with no index at the end.
-        val truncated = File(dir, "cut.mp4").also { it.writeBytes(target.readBytes().copyOf(target.length().toInt() / 2)) }
-        assertNotNull(verifier.verify(truncated, ClipExpectation(1, span)))
+        assertNotNull("cut at 50%", verifier.verify(variant("cut50.mp4", bytes.copyOf(bytes.size / 2)), expect))
+        assertNotNull("cut at 90%", verifier.verify(variant("cut90.mp4", bytes.copyOf(bytes.size * 9 / 10)), expect))
 
-        assertNotNull("wrong track count", verifier.verify(target, ClipExpectation(2, span)))
+        val mdat = indexOf(bytes, "mdat".toByteArray())
+        assertTrue("the file has a media data box", mdat >= 0)
+        assertNotNull(
+            "cut right after the front of the media data, index (wherever it is) intact or not",
+            verifier.verify(variant("front.mp4", bytes.copyOf(mdat + 16)), expect)
+        )
+
+        assertNotNull(
+            "the last 100 bytes removed",
+            verifier.verify(variant("minus100.mp4", bytes.copyOf(bytes.size - 100)), expect)
+        )
+        assertNotNull("a zero-length file", verifier.verify(variant("empty.mp4", ByteArray(0)), expect))
+        assertNotNull("not an MP4 at all", verifier.verify(variant("junk.mp4", ByteArray(2_000) { 5 }), expect))
+        assertNotNull("wrong track count", verifier.verify(good, ClipExpectation(2, expect.spanUs, expect.minBytes)))
+    }
+
+    @Test
+    fun aGarbageTailOfTheRightSizeIsReportedNotAsserted() {
+        // The container cannot tell good H.264 from garbage: the extractor reads whatever bytes the
+        // sample table points at. Whether this is caught depends on the extractor's NAL handling, so
+        // this documents the outcome on the device rather than demanding one. What must hold is that
+        // the verifier answers instead of crashing.
+        val video = encodeVideo()
+        val (good, expect) = goodMp4(video)
+        val bytes = good.readBytes()
+        val garbled = bytes.copyOf()
+        for (i in bytes.size * 7 / 10 until bytes.size) garbled[i] = 0x5A
+        val file = File(dir, "garbage.mp4").also { it.writeBytes(garbled) }
+        assertEquals(bytes.size.toLong(), file.length())
+
+        val answer = MediaExtractorVerifier().verify(file, expect)
+
+        Log.i(TAG, "garbage tail of correct size: ${answer ?: "ACCEPTED (beyond the container-level checks)"}")
+    }
+
+    // --- format conversion through the real MediaFormat ---
+
+    @Test
+    fun frameRateIsReadWhetherTheFormatHoldsAnIntAFloatOrNothing() {
+        val formats = AndroidClipFormats()
+        fun base() = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, 320, 240)
+
+        val asInt = base().apply { setInteger(MediaFormat.KEY_FRAME_RATE, 30) }
+        val asFloat = base().apply { setFloat(MediaFormat.KEY_FRAME_RATE, 29.97f) }
+        val absent = base()
+
+        assertEquals(30, formats.videoInfo(asInt).frameRate)
+        assertEquals(30, formats.videoInfo(asFloat).frameRate)
+        assertEquals(-1, formats.videoInfo(absent).frameRate)
+        assertEquals(320, formats.videoInfo(absent).width)
+        assertEquals(240, formats.videoInfo(absent).height)
+        val back = formats.video(formats.videoInfo(asFloat))
+        assertEquals(320, back.getInteger(MediaFormat.KEY_WIDTH))
+        assertEquals(30, back.getInteger(MediaFormat.KEY_FRAME_RATE))
+        assertFalse(formats.video(formats.videoInfo(absent)).containsKey(MediaFormat.KEY_FRAME_RATE))
+    }
+
+    // --- a crash, staged ---
+
+    @Test
+    fun aClipAnEarlierRunDiedInTheMiddleOfIsRebuiltAtServiceStartAndItsJournalGoesOnlyAfterVerification() {
+        val video = encodeVideo()
+        val formats = AndroidClipFormats()
+        val store = EventStore(File(dir, "store").also { it.mkdirs() })
+        val event = store.createDetectionEvent("person", 0.9, null, recording = true)
+        val journal = store.journalFileFor(event.id)
+
+        // As the recorder would have left it when the process was killed: the header and a stretch
+        // of samples journaled and flushed, no close, and an MP4 with no index.
+        val partway = video.samples.take(40)
+        val writer = ClipJournalWriter(journal, JournalHeader(1_700_000_000_000L, formats.videoInfo(video.format), null))
+        for ((data, pts, key) in partway) writer.append(true, pts, key, data)
+        writer.flush()
+        store.clipFileFor(event.id).writeBytes(ByteArray(4_096))
+
+        // --- what CctvServerService.onCreate does ---
+        assertEquals("the interrupted clip has a journal, so it is not simply cleared", 0, store.recoverInterrupted())
+        store.deleteOrphanJournals()
+        val pending = store.pendingJournalRebuilds()
+        assertEquals(listOf(event.id), pending.map { it.id })
+        assertEquals("still recording: the archive skips it", ArchiveResult.RECORDING, store.archiveEvent(event.id))
+
+        var journalExistedWhenVerified = false
+        val spy = object : ClipVerifier {
+            override fun verify(file: File, expect: ClipExpectation): String? {
+                journalExistedWhenVerified = journal.exists()
+                return MediaExtractorVerifier().verify(file, expect)
+            }
+        }
+        val failures = mutableListOf<ClipFailure>()
+        val recorder = ClipRecorder(
+            onClipFinished = { clip ->
+                store.attachClip(
+                    clip.eventId, clip.file, System.currentTimeMillis(), clip.durationUs / 1000, clip.clipStartMs,
+                    null, null, held = false,
+                    clipError = clip.recoveredFrom?.toClipError(),
+                    recovered = clip.recoveredFrom != null && !clip.unverified
+                )
+            },
+            onRollover = { null },
+            onClipFailed = { failures.add(it) },
+            safety = ClipSafety(formats, spy, executor = Executor { it.run() })
+        )
+        for (e in pending) recorder.rebuildInterrupted(e.id, store.clipFileFor(e.id), store.journalFileFor(e.id))
+        writer.close()
+
+        assertTrue("rebuild reported failures: ${failures.map { it.message }}", failures.isEmpty())
+        assertTrue("the journal was still there when the MP4 was verified", journalExistedWhenVerified)
+        assertFalse("and is gone once it passed", journal.exists())
+        val stored = store.getEvent(event.id)!!
+        assertFalse(stored.recording)
+        assertTrue(stored.clipRecovered)
+        assertEquals("INTERRUPTED", stored.clipError?.reason)
+        assertNotNull(stored.clipFileName)
+        val span = partway.last().second - partway.first().second
+        val clip = store.clipFileFor(event.id)
+        assertTrue(clip.length() >= partway.sumOf { it.first.size.toLong() })
+        assertNull(MediaExtractorVerifier().verify(clip, ClipExpectation(1, span, partway.sumOf { it.first.size.toLong() })))
+        assertTrue(store.pendingJournalRebuilds().isEmpty())
+    }
+
+    private fun indexOf(haystack: ByteArray, needle: ByteArray): Int {
+        outer@ for (i in 0..haystack.size - needle.size) {
+            for (j in needle.indices) if (haystack[i + j] != needle[j]) continue@outer
+            return i
+        }
+        return -1
     }
 }

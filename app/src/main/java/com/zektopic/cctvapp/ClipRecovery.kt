@@ -182,6 +182,8 @@ class ClipRecovery(
         val videoSamples: Int = 0,
         val audioSamples: Int = 0,
         val hadAudioTrack: Boolean = false,
+        /** Sample bytes in the rebuilt MP4. */
+        val payloadBytes: Long = 0,
         /** Why each failed step failed, for the log and the event. */
         val error: String? = null
     ) {
@@ -241,7 +243,7 @@ class ClipRecovery(
                     Log.i(TAG, "Rebuilt ${target.name} from its journal ($step)")
                     return Result(
                         if (r.hadAudioTrack) Outcome.REBUILT else Outcome.REBUILT_VIDEO_ONLY,
-                        scan, r.videoSamples, r.audioSamples, r.hadAudioTrack,
+                        scan, r.videoSamples, r.audioSamples, r.hadAudioTrack, r.payloadBytes,
                         error = errors.takeIf { it.isNotEmpty() }?.joinToString("; ")
                     )
                 }
