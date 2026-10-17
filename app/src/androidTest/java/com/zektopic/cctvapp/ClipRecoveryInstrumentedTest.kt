@@ -1,8 +1,10 @@
 package com.zektopic.cctvapp
 
+import android.app.Instrumentation
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
+import android.os.Bundle
 import android.os.SystemClock
 import android.util.Log
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -206,41 +208,77 @@ class ClipRecoveryInstrumentedTest {
         assertNotNull("and claiming one track is wrong", MediaExtractorVerifier().verify(target, ClipExpectation(1, span)))
     }
 
+    // --- reporting that does not depend on logcat ---
+
+    /** Every case's observed answer, in order: "ACCEPTED" or the verifier's reason (which names the check). */
+    private val observed = linkedMapOf<String, String>()
+
+    private fun observe(case: String, answer: String?) {
+        observed[case] = answer ?: "ACCEPTED"
+        Log.i(TAG, "$case -> ${observed[case]}")
+    }
+
+    /**
+     * Sends every observed answer through the instrumentation status stream, so `am instrument -w -r`
+     * prints them (logcat's main buffer is only 64 KiB and is gone in minutes), and appends them to a
+     * results file in the test package's own cache directory.
+     */
+    private fun publish(title: String) {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val text = observed.entries.joinToString("\n") { "${it.key}: ${it.value}" }
+        val bundle = Bundle()
+        for ((case, answer) in observed) bundle.putString("$title.${case.replace(Regex("[^A-Za-z0-9]+"), "_")}", answer)
+        bundle.putString(Instrumentation.REPORT_KEY_STREAMRESULT, "\n== $title ==\n$text\n")
+        instrumentation.sendStatus(0, bundle)
+        File(instrumentation.context.cacheDir, "clip-recovery-results.txt").appendText("== $title ==\n$text\n")
+    }
+
     @Test
     fun theVerifierRejectsDamagedFilesAndAcceptsTheGoodOne() {
         val video = encodeVideo()
         val (good, expect) = goodMp4(video)
         val verifier = MediaExtractorVerifier()
         val bytes = good.readBytes()
-        fun variant(name: String, content: ByteArray) = File(dir, name).also { it.writeBytes(content) }
-
-        assertNull("positive control: the untouched file passes", verifier.verify(good, expect))
-
-        assertNotNull("cut at 50%", verifier.verify(variant("cut50.mp4", bytes.copyOf(bytes.size / 2)), expect))
-        assertNotNull("cut at 90%", verifier.verify(variant("cut90.mp4", bytes.copyOf(bytes.size * 9 / 10)), expect))
-
         val mdat = indexOf(bytes, "mdat".toByteArray())
         assertTrue("the file has a media data box", mdat >= 0)
-        assertNotNull(
-            "cut right after the front of the media data, index (wherever it is) intact or not",
-            verifier.verify(variant("front.mp4", bytes.copyOf(mdat + 16)), expect)
-        )
+        val problems = mutableListOf<String>()
 
-        assertNotNull(
-            "the last 100 bytes removed",
-            verifier.verify(variant("minus100.mp4", bytes.copyOf(bytes.size - 100)), expect)
+        fun variant(name: String, content: ByteArray) = File(dir, name).also { it.writeBytes(content) }
+        // One failing case must not hide the others: note it and carry on.
+        fun mustReject(case: String, file: File, expected: ClipExpectation = expect) {
+            val answer = verifier.verify(file, expected)
+            observe(case, answer)
+            if (answer == null) problems.add("$case was ACCEPTED")
+        }
+
+        val control = verifier.verify(good, expect)
+        observe("untouched file (must be accepted)", control)
+        if (control != null) problems.add("the untouched file was REJECTED: $control")
+
+        mustReject("cut at 50%", variant("cut50.mp4", bytes.copyOf(bytes.size / 2)))
+        mustReject("cut at 90%", variant("cut90.mp4", bytes.copyOf(bytes.size * 9 / 10)))
+        mustReject("cut right after the front of the media data", variant("front.mp4", bytes.copyOf(mdat + 16)))
+        mustReject("last 100 bytes removed", variant("minus100.mp4", bytes.copyOf(bytes.size - 100)))
+        mustReject("last 1 byte removed", variant("minus1.mp4", bytes.copyOf(bytes.size - 1)))
+        mustReject("100 garbage bytes appended", variant("plus100.mp4", bytes + ByteArray(100) { 0x5A }))
+        mustReject("zero-length file", variant("empty.mp4", ByteArray(0)))
+        mustReject("not an MP4 at all", variant("junk.mp4", ByteArray(2_000) { 5 }))
+        mustReject("wrong track count", good, ClipExpectation(2, expect.spanUs, expect.minBytes))
+
+        publish("damaged-files")
+        assertTrue(
+            "${problems.size} verifier gap(s):\n${problems.joinToString("\n")}\n\nAll answers:\n" +
+                observed.entries.joinToString("\n") { "${it.key}: ${it.value}" },
+            problems.isEmpty()
         )
-        assertNotNull("a zero-length file", verifier.verify(variant("empty.mp4", ByteArray(0)), expect))
-        assertNotNull("not an MP4 at all", verifier.verify(variant("junk.mp4", ByteArray(2_000) { 5 }), expect))
-        assertNotNull("wrong track count", verifier.verify(good, ClipExpectation(2, expect.spanUs, expect.minBytes)))
     }
 
     @Test
     fun aGarbageTailOfTheRightSizeIsReportedNotAsserted() {
         // The container cannot tell good H.264 from garbage: the extractor reads whatever bytes the
         // sample table points at. Whether this is caught depends on the extractor's NAL handling, so
-        // this documents the outcome on the device rather than demanding one. What must hold is that
-        // the verifier answers instead of crashing.
+        // this records the outcome on the device (in the status stream and the results file) rather
+        // than demanding one. What must hold is that the verifier answers instead of crashing.
         val video = encodeVideo()
         val (good, expect) = goodMp4(video)
         val bytes = good.readBytes()
@@ -249,11 +287,10 @@ class ClipRecoveryInstrumentedTest {
         val file = File(dir, "garbage.mp4").also { it.writeBytes(garbled) }
         assertEquals(bytes.size.toLong(), file.length())
 
-        val answer = MediaExtractorVerifier().verify(file, expect)
+        observe("garbage tail of the correct size (last 30%)", MediaExtractorVerifier().verify(file, expect))
 
-        Log.i(TAG, "garbage tail of correct size: ${answer ?: "ACCEPTED (beyond the container-level checks)"}")
+        publish("garbage-tail")
     }
-
     // --- format conversion through the real MediaFormat ---
 
     @Test
