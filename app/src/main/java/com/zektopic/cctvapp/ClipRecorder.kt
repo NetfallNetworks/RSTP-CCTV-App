@@ -350,10 +350,11 @@ class ClipRecorder(
      * with audio that precedes its first video frame.
      *
      * The audio track is only added when audio looks alive right now
-     * ([AudioHealth.flowing]), not merely when it's expected: a track added to a
-     * MediaMuxer but never given a single sample throws on stop() (see [finish]), so a
-     * clip started while the microphone has gone quiet just gets video, the same as a
-     * clip started when audio was never expected at all. [audioExpected] itself is left
+     * ([AudioHealth.flowing]) and there is at least one audio frame to start it with, not
+     * merely when it's expected: a track added to a MediaMuxer but never given a single
+     * sample throws on stop() (see [finish]), so a clip started while the microphone has
+     * gone quiet just gets video, the same as a clip started when audio was never expected
+     * at all. [audioExpected] itself is left
      * alone here -- this is a per-clip decision, not a verdict that audio is gone for the
      * rest of the session (that's [maybeDegradeAudio]'s job).
      */
@@ -365,17 +366,25 @@ class ClipRecorder(
             return false
         }
         val nowUs = buffer.newestPtsUs ?: frames.last().ptsUs
-        val includeAudio = audioExpected && AudioHealth.flowing(audioPreRoll.newestPtsUs, nowUs, AUDIO_WAIT_TIMEOUT_US)
+        val startUs = frames.first().ptsUs
+        // Worked out before the track is added: alive audio can still have nothing at or after
+        // the video pre-roll's first frame (just after a stream restart, or audio running late),
+        // and an audio track that never gets a sample makes stop() throw, losing the whole clip.
+        val audioFrames =
+            if (audioExpected && AudioHealth.flowing(audioPreRoll.newestPtsUs, nowUs, AUDIO_WAIT_TIMEOUT_US)) {
+                audioPreRoll.framesFrom(startUs)
+            } else {
+                emptyList()
+            }
 
         var muxer: ClipMuxer? = null
         var audioAdded = false
         return try {
             muxer = muxerFactory(target.file)
             val videoTrack = muxer.addTrack(format)
-            val audioTrack = if (includeAudio) muxer.addTrack(audioFormat!!) else null
+            val audioTrack = if (audioFrames.isNotEmpty()) muxer.addTrack(audioFormat!!) else null
             audioAdded = audioTrack != null
             muxer.start()
-            val startUs = frames.first().ptsUs
             val clipStartMs = System.currentTimeMillis() - (nowUs - startUs) / 1000
             val clip = ActiveClip(
                 target, muxer, videoTrack, audioTrack,
@@ -384,7 +393,7 @@ class ClipRecorder(
             )
             for (frame in frames) writeVideo(clip, frame)
             if (audioTrack != null) {
-                for (frame in audioPreRoll.framesFrom(startUs)) writeAudio(clip, frame)
+                for (frame in audioFrames) writeAudio(clip, frame)
             }
             clip.window.hold(holdUntilUs)
             active = clip

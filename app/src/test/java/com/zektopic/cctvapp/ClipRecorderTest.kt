@@ -270,4 +270,24 @@ class ClipRecorderTest {
         r.recorder.trigger { Thread.sleep(25); newTarget() }
         assertTrue(r.recorder.stats().maxStartHoldMs >= 25)
     }
+
+    // --- no audio track unless it is given a sample ---
+
+    @Test
+    fun `audio that is fresh but older than the pre-roll start does not add an empty track`() {
+        val r = rig(audio = true)
+        // Audio exists up to one second before video starts, e.g. right after a stream restart.
+        val audioPts = baseUs - 1_000_000L
+        r.recorder.onAudioFrame(AudioPreRollBuffer.Frame(frameBytes(audioPts), audioPts))
+        audioOn = false
+        advance(r, 1.0)
+
+        assertEquals(ClipRecorder.Outcome.STARTED, trigger(r).outcome)
+        advance(r, 2.0)
+
+        assertEquals("video only", 1, r.muxers.single().tracks.size)
+        assertTrue("the clip finalises", r.recorder.stop())
+        assertTrue(r.failures.isEmpty())
+        assertEquals(1, r.finished.size)
+    }
 }
