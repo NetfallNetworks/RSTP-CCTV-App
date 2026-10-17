@@ -90,6 +90,7 @@ class MediaExtractorVerifier : ClipVerifier {
     /** One verification's scratch space for sample bytes; per call, because verify() can run on two threads. */
     private class ReadBuffer {
         var buffer: ByteBuffer = ByteBuffer.allocate(INITIAL_READ_BUFFER_BYTES)
+        var shortRead: String? = null
     }
 
     /** Reads the current sample's bytes into [scratch] (grown if the sample is bigger); -1 at the end. */
@@ -99,20 +100,38 @@ class MediaExtractorVerifier : ClipVerifier {
             if (need > scratch.buffer.capacity()) scratch.buffer = ByteBuffer.allocate(need.toInt())
         }
         scratch.buffer.clear()
-        return extractor.readSampleData(scratch.buffer, 0)
+        val read = extractor.readSampleData(scratch.buffer, 0)
+        if (read >= 0 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            // A read that returns fewer bytes than the sample table says the sample has is a
+            // sample cut off by the end of the file.
+            val declared = extractor.sampleSize
+            if (declared >= 0 && declared != read.toLong()) {
+                scratch.shortRead = "sample at ${extractor.sampleTime} us: read $read of $declared bytes"
+                return -1
+            }
+        }
+        return read
     }
 
     override fun verify(file: File, expect: ClipExpectation): String? {
         val startedMs = SystemClock.elapsedRealtime()
-        // First, the check that needs no extractor: a file shorter than the sample data written to
-        // it is cut off, even if its index (reserved near the front by some muxers) reads fine.
+        // First the checks that need no extractor, which trusts an index that some muxers keep near
+        // the front and so reads a cut-off file happily: the top-level boxes must add up to exactly
+        // the file, and the file must hold at least the sample data written to it.
         val fileBytes = file.length()
+        Mp4BoxWalk.check(file)?.let {
+            val why = "box walk: $it"
+            Log.i(TAG, "${file.name}: $why -> rejected")
+            return why
+        }
         ClipVerification.checkSize(expect, fileBytes)?.let {
-            Log.i(TAG, "${file.name}: $it -> rejected")
-            return it
+            val why = "size check: $it"
+            Log.i(TAG, "${file.name}: $why -> rejected")
+            return why
         }
         val extractor = MediaExtractor()
         val scratch = ReadBuffer()
+        var shortRead: String? = null
         var tracks = -1
         var withSamples = -1
         var durationUs: Long? = null
@@ -139,20 +158,23 @@ class MediaExtractorVerifier : ClipVerifier {
                     var steps = 0
                     while (steps++ < MAX_TAIL_STEPS) {
                         // A read of -1 before the duration is reached means the data ends early.
-                        if (readSample(extractor, scratch) < 0) break
+                        if (readSample(extractor, scratch) < 0) break // end of data, or a short read (noted in scratch)
                         val t = extractor.sampleTime
                         if (t > last) last = t
                         reads++
                         if (!extractor.advance()) break
                     }
-                    ok = reads > 0 && ClipVerification.tailReached(last, trackDuration)
+                    ok = scratch.shortRead == null && reads > 0 && ClipVerification.tailReached(last, trackDuration)
                 }
+                scratch.shortRead?.let { shortRead = shortRead ?: it }
+                scratch.shortRead = null
                 extractor.unselectTrack(i)
                 if (ok) withSamples++
             }
-            result = ClipVerification.check(expect, ClipProbe(tracks, withSamples, durationUs, fileBytes))
+            result = (shortRead ?: ClipVerification.check(expect, ClipProbe(tracks, withSamples, durationUs, fileBytes)))
+                ?.let { "extractor: $it" }
         } catch (e: Exception) {
-            result = "could not open: ${ClipFailure.detailOf(e)}"
+            result = "extractor: could not open: ${ClipFailure.detailOf(e)}"
         } finally {
             try { extractor.release() } catch (_: Exception) {}
             Log.i(
