@@ -273,8 +273,7 @@ class CctvServerService : Service(), ConnectChecker, SurfaceHolder.Callback {
                     clip.clipStartMs, timeline?.detectionsJson(), timeline?.activityJson(),
                     held = clip.continued,
                     clipError = clip.recoveredFrom?.toClipError(),
-                    recovered = clip.recoveredFrom != null && !clip.damaged,
-                    journalKept = clip.damaged
+                    recovered = clip.recoveredFrom != null && !clip.unverified
                 )
                 if (!clip.continued) eventStore.releaseVisit(visitId)
             }

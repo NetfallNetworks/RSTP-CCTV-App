@@ -148,7 +148,7 @@ class ClipJournalRecorderTest {
         val cause = clip.recoveredFrom!!
         assertEquals(ClipFailureReason.FINALISE_FAILED, cause.reason)
         assertEquals("verification failed: duration 1 ms, journal covers 4000 ms", cause.message)
-        assertFalse(clip.damaged)
+        assertFalse(clip.unverified)
         assertEquals("event-0", clip.eventId)
         assertTrue("both tracks came back", clip.hadAudioTrack && clip.audioSamples > 0)
         assertEquals(2, r.muxers.size)
@@ -217,22 +217,40 @@ class ClipJournalRecorderTest {
     }
 
     @Test
-    fun `when the MP4 finalised but cannot be verified or rebuilt it is attached as damaged and the journal kept`() {
+    fun `an MP4 that finalised but fails verification and a rebuild too is kept as a normal clip, not damaged`() {
         val r = rig(FakeVerifier("duration 1 ms, journal covers 4000 ms", "bad", "bad"))
         recordClip(r)
 
         assertFalse(r.recorder.stop())
 
         val clip = r.finished.single()
-        assertTrue(clip.damaged)
-        assertEquals(ClipFailureReason.FINALISE_FAILED, clip.recoveredFrom!!.reason)
+        assertTrue(clip.unverified)
+        val note = clip.recoveredFrom!!
+        assertEquals(ClipFailureReason.UNVERIFIED, note.reason)
+        assertTrue(note.message!!.startsWith("verification failed: duration 1 ms"))
+        assertTrue(note.message!!.contains("rebuild:"))
         assertTrue("the original MP4 is attached as it was", clip.file.exists())
         assertEquals("the original is not overwritten", "mp4", clip.file.readText())
-        assertEquals(1, journals().size)
+        assertTrue("the journal goes, or the event could never be archived", journals().isEmpty())
         assertTrue(r.failures.isEmpty())
-        assertEquals(0L, r.recorder.stats().clipsRecovered)
+        val stats = r.recorder.stats()
+        assertEquals(1L, stats.clipsUnverified)
+        assertEquals("not a loss", 0L, stats.clipFailures)
+        assertEquals(0L, stats.clipsRecovered)
+        assertEquals(ClipFailureReason.UNVERIFIED, stats.lastFailure!!.reason)
     }
 
+    @Test
+    fun `a verification failure that the rebuild fixes is a recovery and counts as a failure once`() {
+        val r = rig(FakeVerifier("bad", null))
+        recordClip(r)
+
+        r.recorder.stop()
+
+        assertEquals(1L, r.recorder.stats().clipFailures)
+        assertEquals(1L, r.recorder.stats().clipsRecovered)
+        assertEquals(0L, r.recorder.stats().clipsUnverified)
+    }
     // --- the safety net must never cost the clip ---
 
     @Test

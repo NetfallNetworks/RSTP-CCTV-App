@@ -159,6 +159,7 @@ data class ClipError(
 ) {
     /** For example "finalise failed after 9m12s (audio track, 0 audio samples, 16000 video samples)". */
     fun summary(): String {
+        if (reason == "UNVERIFIED") return "kept without verification (${detail ?: "no detail"})"
         val what = reason.lowercase().replace('_', ' ')
         val after = if (recordedMs > 0) " after ${formatDuration(recordedMs)}" else ""
         val tracks = if (audioTrack) "audio track, $audioSamples audio samples" else "no audio track"

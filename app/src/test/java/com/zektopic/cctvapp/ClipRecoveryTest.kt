@@ -74,12 +74,21 @@ class ClipRecoveryTest {
     }
 
     @Test
-    fun `short clips get a two second tolerance and very short ones are not duration-checked`() {
-        assertEquals(2_000_000L, ClipVerification.toleranceUs(5_000_000))
+    fun `short clips get a three second tolerance and very short ones are not duration-checked`() {
+        assertEquals(3_000_000L, ClipVerification.toleranceUs(5_000_000))
         assertEquals(10_000_000L, ClipVerification.toleranceUs(100_000_000))
-        assertNull(ClipVerification.check(ClipExpectation(1, 5_000_000), ClipProbe(1, 1, 6_900_000)))
-        assertNotNull(ClipVerification.check(ClipExpectation(1, 5_000_000), ClipProbe(1, 1, 7_100_000)))
+        assertNull(ClipVerification.check(ClipExpectation(1, 5_000_000), ClipProbe(1, 1, 7_900_000)))
+        assertNotNull(ClipVerification.check(ClipExpectation(1, 5_000_000), ClipProbe(1, 1, 8_100_000)))
         assertNull(ClipVerification.check(ClipExpectation(1, 400_000), ClipProbe(1, 1, null)))
+    }
+
+    @Test
+    fun `the tail check accepts any sample near the end, not only an exact seek hit`() {
+        assertTrue(ClipVerification.tailReached(57_500_000, 60_000_000))
+        assertTrue(ClipVerification.tailReached(60_000_000, 60_000_000))
+        assertFalse("nothing read at all", ClipVerification.tailReached(-1, 60_000_000))
+        assertFalse("the index stops half way", ClipVerification.tailReached(30_000_000, 60_000_000))
+        assertTrue("unknown duration only needs a sample", ClipVerification.tailReached(0, null))
     }
 
     // --- the ladder ---

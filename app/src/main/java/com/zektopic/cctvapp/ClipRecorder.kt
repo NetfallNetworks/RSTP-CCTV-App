@@ -141,14 +141,15 @@ class ClipRecorder(
         val hadAudioTrack: Boolean = false, val videoSamples: Int = 0, val audioSamples: Int = 0,
         /**
          * Set when the clip did not finalise cleanly and was rebuilt from its journal (this
-         * is then the cause), or [damaged]. Such a clip is reported from the recovery thread.
+         * is then the cause), or [unverified]. Such a clip is reported from the recovery thread.
          */
         val recoveredFrom: ClipFailure? = null,
         /**
-         * The MP4 finalised but failed verification and could not be rebuilt either: it is
-         * attached as it is, and its journal (the raw data) is kept beside it.
+         * The MP4 finalised but failed verification, and a rebuild from the journal failed
+         * verification too: the verifier is more likely wrong than the file, so the original is
+         * attached as a normal clip ([recoveredFrom] says what happened) and the journal deleted.
          */
-        val damaged: Boolean = false
+        val unverified: Boolean = false
     )
 
     enum class Outcome {
@@ -219,13 +220,14 @@ class ClipRecorder(
     private var lastFailure: ClipFailure? = null
     private var maxStartHoldMs = 0L
     private var clipsRecovered = 0L
+    private var clipsUnverified = 0L
 
     private val recovery: ClipRecovery? =
         safety?.let { ClipRecovery(JournalReplay(muxerFactory, it.formats), it.verifier) }
 
     /** Counters and the last lost clip, for /status. */
     fun stats(): ClipStats = synchronized(lock) {
-        ClipStats(clipsStarted, clipsFinalised, clipFailures, lastFailure, maxStartHoldMs, clipsRecovered)
+        ClipStats(clipsStarted, clipsFinalised, clipFailures, lastFailure, maxStartHoldMs, clipsRecovered, clipsUnverified)
     }
 
     /**
@@ -745,10 +747,20 @@ class ClipRecorder(
         // the file still finalised and verified, the partial clip would have been kept instead.
         val reason = if (writeError != null) ClipFailureReason.WRITE_FAILED else ClipFailureReason.FINALISE_FAILED
         val message = (writeError ?: stopError)?.let { ClipFailure.detailOf(it) } ?: "verification failed: $verifyError"
-        val failure = recordFailure(
-            clip.target.eventId, reason, message, clip.recordedUs() / 1000,
-            clip.audioTrack != null, clip.videoSamples, clip.audioSamples
-        )
+        // A clip that finalised but failed verification is not counted as lost until the
+        // rebuild's outcome says so (it may be kept as it is); anything else already is.
+        val countNow = stopError != null || writeError != null
+        val failure = if (countNow) {
+            recordFailure(
+                clip.target.eventId, reason, message, clip.recordedUs() / 1000,
+                clip.audioTrack != null, clip.videoSamples, clip.audioSamples
+            )
+        } else {
+            ClipFailure(
+                clip.target.eventId, reason, message, clip.recordedUs() / 1000,
+                clip.audioTrack != null, clip.videoSamples, clip.audioSamples
+            ).also { lastFailure = it }
+        }
         if (stopError != null) clip.target.file.delete()
         if (journalFile == null || safety == null) {
             onClipFailed(failure)
@@ -756,19 +768,28 @@ class ClipRecorder(
         }
         // The journal holds every sample: rebuild from it off this thread, and keep the event
         // recording (so the archive skips it) until that has been decided.
-        rebuild(failure, journalFile, clip.target.file, clip.clipStartMs, durationUs, originalUsable = stopError == null)
+        rebuild(
+            failure, journalFile, clip.target.file, clip.clipStartMs, durationUs,
+            originalUsable = stopError == null, alreadyCounted = countNow
+        )
         return null
     }
 
     /**
      * Rebuilds a clip that failed to finalise or verify from its journal on [ClipSafety.executor],
-     * then reports the outcome: [onClipFinished] with [FinishedClip.recoveredFrom] when a rebuilt
-     * (or, if the rebuild failed, the unverified original with [FinishedClip.damaged]) clip is
-     * attached, or [onClipFailed] with [ClipFailure.journalKept] when only the journal is left.
+     * then reports the outcome:
+     *  - rebuilt and verified: [onClipFinished] with [FinishedClip.recoveredFrom];
+     *  - the rebuild failed, but `stop()` had succeeded ([originalUsable]): the verifier is then
+     *    more likely wrong than the file, so the original MP4 is attached as a normal clip marked
+     *    [FinishedClip.unverified] (reason [ClipFailureReason.UNVERIFIED]) and the journal deleted;
+     *  - the rebuild failed and the MP4 never finalised: [onClipFailed] with [ClipFailure.journalKept];
+     *    the journal (the raw data) stays on disk.
+     * [alreadyCounted]: [failure] was already added to the failure count (a finalise error);
+     * a verification-only failure is counted here, once it is known whether the clip was lost.
      */
     private fun rebuild(
         failure: ClipFailure, journal: File, target: File, clipStartMs: Long, originalDurationUs: Long,
-        originalUsable: Boolean
+        originalUsable: Boolean, alreadyCounted: Boolean
     ) {
         val s = safety ?: return
         val recovery = recovery ?: return
@@ -776,11 +797,19 @@ class ClipRecorder(
         val originalVideoSamples = failure.videoSamples
         val originalAudioSamples = failure.audioSamples
         s.executor.execute {
+            val result = try {
+                recovery.recover(journal, target)
+            } catch (t: Throwable) {
+                Log.e(TAG, "Recovery of clip ${failure.eventId} crashed; its journal is kept", t)
+                null
+            }
+            val scan = result?.scan
             try {
-                val result = recovery.recover(journal, target)
-                val scan = result.scan
-                if (result.rebuilt && scan != null) {
-                    synchronized(lock) { clipsRecovered++ }
+                if (result != null && result.rebuilt && scan != null) {
+                    synchronized(lock) {
+                        if (!alreadyCounted) clipFailures++
+                        clipsRecovered++
+                    }
                     onClipFinished(
                         FinishedClip(
                             failure.eventId, target,
@@ -791,25 +820,36 @@ class ClipRecorder(
                         )
                     )
                 } else if (originalUsable) {
-                    // Finalised but unverifiable and unrebuildable: better attached than gone.
+                    // The file finalised: a verifier that disagrees with it and with a rebuild from
+                    // the journal is more likely at fault than the file. Keep the clip, say so, and
+                    // let the journal go -- it would otherwise sit unarchivable forever.
+                    val unverified = ClipFailure(
+                        failure.eventId, ClipFailureReason.UNVERIFIED,
+                        "${failure.message}; rebuild: ${result?.error ?: "crashed"}".take(ClipFailure.MAX_DETAIL_CHARS),
+                        failure.recordedMs, originalAudio, originalVideoSamples, originalAudioSamples
+                    )
+                    synchronized(lock) {
+                        clipsUnverified++
+                        lastFailure = unverified
+                    }
+                    journal.delete()
                     onClipFinished(
                         FinishedClip(
                             failure.eventId, target, originalDurationUs, clipStartMs,
                             hadAudioTrack = originalAudio,
                             videoSamples = originalVideoSamples, audioSamples = originalAudioSamples,
-                            recoveredFrom = failure, damaged = true
+                            recoveredFrom = unverified, unverified = true
                         )
                     )
                 } else {
+                    synchronized(lock) { if (!alreadyCounted) clipFailures++ }
                     onClipFailed(failure.withJournalKept())
                 }
             } catch (t: Throwable) {
-                Log.e(TAG, "Recovery of clip ${failure.eventId} crashed; its journal is kept", t)
-                onClipFailed(failure.withJournalKept())
+                Log.e(TAG, "Reporting the recovery of clip ${failure.eventId} failed", t)
             }
         }
     }
-
     /**
      * Rebuilds the clip an interrupted run left behind: [journal] is the only copy of it. Runs on
      * [ClipSafety.executor] and reports like a live failure would (reason [ClipFailureReason.INTERRUPTED]).

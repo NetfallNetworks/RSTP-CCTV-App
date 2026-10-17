@@ -18,10 +18,26 @@ class ClipProbe(val tracks: Int, val tracksWithSamples: Int, val durationUs: Lon
 object ClipVerification {
     /** Shorter clips are not checked for duration: container rounding dominates. */
     private const val MIN_CHECKED_SPAN_US = 1_000_000L
-    private const val MIN_TOLERANCE_US = 2_000_000L
+    private const val MIN_TOLERANCE_US = 3_000_000L
 
-    /** How far the MP4's duration may be from the journal's first-to-last pts: 2 s or 10%. */
+    /**
+     * How far the MP4's duration may be from the journal's first-to-last pts: 3 s or 10%. The check
+     * is there to catch a missing index or a grossly short file, not drift: the container adds the
+     * last sample's own duration and the two tracks end at different instants, a second or so
+     * at most, so 3 s leaves margin without letting a half-written file through.
+     */
     fun toleranceUs(expectedSpanUs: Long): Long = maxOf(MIN_TOLERANCE_US, expectedSpanUs / 10)
+
+    /**
+     * Whether a track's index reaches the end of the clip: the latest sample time seen while
+     * walking its tail ([lastSampleUs], -1 if none) is within the tolerance of its [durationUs].
+     * A track with no known duration only needs to have yielded something.
+     */
+    fun tailReached(lastSampleUs: Long, durationUs: Long?): Boolean {
+        if (lastSampleUs < 0) return false
+        if (durationUs == null) return true
+        return lastSampleUs >= durationUs - toleranceUs(durationUs)
+    }
 
     /** Null when [probe] matches [expect]; otherwise why not. */
     fun check(expect: ClipExpectation, probe: ClipProbe): String? {

@@ -11,7 +11,12 @@ enum class ClipFailureReason {
     /** The per-file cap was reached, the previous part was kept, and no continuation could be opened. */
     ROLLOVER_DECLINED,
     /** The process or device stopped mid-clip; found at the next start from the journal it left. */
-    INTERRUPTED
+    INTERRUPTED,
+    /**
+     * The file finalised but the verifier disagreed, and so did a rebuild from the journal. The
+     * clip was kept as it is: not a loss, but not vouched for either.
+     */
+    UNVERIFIED
 }
 
 /**
@@ -75,11 +80,13 @@ class ClipStats(
     /** Longest time one clip start held the recorder's lock, ms; the stall encoder callbacks saw. */
     val maxStartHoldMs: Long = 0,
     /** Failed clips that were then rebuilt from their journal and kept (also counted in [clipFailures]). */
-    val clipsRecovered: Long = 0
+    val clipsRecovered: Long = 0,
+    /** Clips kept as they finalised although verification (and a rebuild) disagreed; see [ClipFailureReason.UNVERIFIED]. */
+    val clipsUnverified: Long = 0
 ) {
     /** The /status keys, without surrounding braces, ready to splice into its object. */
     fun toJsonFields(): String =
         "\"clipsStarted\":$clipsStarted,\"clipsFinalised\":$clipsFinalised,\"clipFailures\":$clipFailures," +
-            "\"clipsRecovered\":$clipsRecovered," +
+            "\"clipsRecovered\":$clipsRecovered,\"clipsUnverified\":$clipsUnverified," +
             "\"clipStartMaxHoldMs\":$maxStartHoldMs,\"lastClipFailure\":${lastFailure?.toJson() ?: "null"}"
 }

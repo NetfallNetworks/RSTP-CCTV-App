@@ -2,6 +2,8 @@ package com.zektopic.cctvapp
 
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import android.os.SystemClock
+import android.util.Log
 import java.io.File
 import java.nio.ByteBuffer
 
@@ -62,31 +64,61 @@ class AndroidClipFormats : ClipFormats {
  */
 class MediaExtractorVerifier : ClipVerifier {
 
+    companion object {
+        private const val TAG = "ClipVerifier"
+
+        /** Where the tail walk starts, before the end of the track. */
+        private const val TAIL_WALK_US = 5_000_000L
+
+        /** Samples stepped over in the tail walk at most (a few seconds of video plus audio). */
+        private const val MAX_TAIL_STEPS = 3_000
+    }
+
     override fun verify(file: File, expect: ClipExpectation): String? {
+        val startedMs = SystemClock.elapsedRealtime()
         val extractor = MediaExtractor()
+        var tracks = -1
+        var withSamples = -1
+        var durationUs: Long? = null
+        var result: String? = null
         try {
             extractor.setDataSource(file.path)
-            val tracks = extractor.trackCount
-            var withSamples = 0
-            var durationUs: Long? = null
+            tracks = extractor.trackCount
+            withSamples = 0
             for (i in 0 until tracks) {
                 val format = extractor.getTrackFormat(i)
                 val trackDuration = if (format.containsKey(MediaFormat.KEY_DURATION)) format.getLong(MediaFormat.KEY_DURATION) else null
                 if (trackDuration != null) durationUs = maxOf(durationUs ?: 0L, trackDuration)
                 extractor.selectTrack(i)
                 var ok = extractor.sampleTime >= 0
-                if (ok && trackDuration != null && trackDuration > 2_000_000L) {
-                    extractor.seekTo(trackDuration - 1_000_000L, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
-                    ok = extractor.sampleTime >= 0
+                if (ok && trackDuration != null) {
+                    // Land near the end and step to it, instead of trusting one seek to hit a sample:
+                    // any sample time read in the last stretch counts, and the last one read must
+                    // be close to the track's duration.
+                    extractor.seekTo(maxOf(0L, trackDuration - TAIL_WALK_US), MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+                    var last = extractor.sampleTime
+                    var steps = 0
+                    while (steps++ < MAX_TAIL_STEPS && extractor.advance()) {
+                        val t = extractor.sampleTime
+                        if (t > last) last = t
+                    }
+                    ok = ClipVerification.tailReached(last, trackDuration)
                 }
                 extractor.unselectTrack(i)
                 if (ok) withSamples++
             }
-            return ClipVerification.check(expect, ClipProbe(tracks, withSamples, durationUs))
+            result = ClipVerification.check(expect, ClipProbe(tracks, withSamples, durationUs))
         } catch (e: Exception) {
-            return "could not open: ${ClipFailure.detailOf(e)}"
+            result = "could not open: ${ClipFailure.detailOf(e)}"
         } finally {
             try { extractor.release() } catch (_: Exception) {}
+            Log.i(
+                TAG,
+                "${file.name}: tracks=$tracks (expected ${expect.tracks}) withSamples=$withSamples " +
+                    "duration=${durationUs?.div(1000)} ms (journal span ${expect.spanUs / 1000} ms) " +
+                    "in ${SystemClock.elapsedRealtime() - startedMs} ms -> ${result ?: "ok"}"
+            )
         }
+        return result
     }
 }
