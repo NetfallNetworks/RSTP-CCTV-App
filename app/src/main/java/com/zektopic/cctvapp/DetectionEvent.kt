@@ -41,7 +41,12 @@ data class DetectionEvent(
      * all and the archive takes them only once the recording has ended. Null on
      * snapshot-only events.
      */
-    val visitId: String? = null
+    val visitId: String? = null,
+    /**
+     * Why this event's clip is missing or cut short, when [ClipRecorder] lost it. Null on every
+     * event that recorded normally, and on events written before this was kept.
+     */
+    val clipError: ClipError? = null
 ) {
     companion object {
         /** Most specific first; an event's [type] is the highest of its tags. */
@@ -68,7 +73,15 @@ data class DetectionEvent(
                 clipStartMs = if (obj.has("clip_start_ms")) obj.optLong("clip_start_ms") else null,
                 detectionsJson = obj.optJSONArray("detections")?.toString(),
                 activityJson = obj.optJSONObject("activity")?.toString(),
-                visitId = if (obj.has("visit_id")) obj.optString("visit_id") else null
+                visitId = if (obj.has("visit_id")) obj.optString("visit_id") else null,
+                clipError = if (obj.has("clip_error")) ClipError(
+                    reason = obj.optString("clip_error"),
+                    detail = if (obj.has("clip_error_detail")) obj.optString("clip_error_detail") else null,
+                    recordedMs = obj.optLong("clip_error_duration_ms", 0L),
+                    audioTrack = obj.optBoolean("clip_error_audio", false),
+                    videoSamples = obj.optInt("clip_error_video_samples", 0),
+                    audioSamples = obj.optInt("clip_error_audio_samples", 0)
+                ) else null
             )
         }
     }
@@ -102,7 +115,43 @@ data class DetectionEvent(
         if (detectionsJson != null) obj.put("detections", org.json.JSONArray(detectionsJson))
         if (activityJson != null) obj.put("activity", JSONObject(activityJson))
         if (visitId != null) obj.put("visit_id", visitId)
+        if (clipError != null) {
+            obj.put("clip_error", clipError.reason)
+            if (clipError.detail != null) obj.put("clip_error_detail", clipError.detail)
+            obj.put("clip_error_duration_ms", clipError.recordedMs)
+            obj.put("clip_error_audio", clipError.audioTrack)
+            obj.put("clip_error_video_samples", clipError.videoSamples)
+            obj.put("clip_error_audio_samples", clipError.audioSamples)
+            // Derived, for the /clips page; not read back.
+            obj.put("clip_error_summary", clipError.summary())
+        }
         obj.put("created_at", createdAtMs)
         return obj
+    }
+}
+
+/**
+ * A lost clip, as stored on its event. [reason] is a [ClipFailureReason] name kept as text, so
+ * an event written by a newer build still loads and shows.
+ */
+data class ClipError(
+    val reason: String,
+    val detail: String?,
+    val recordedMs: Long,
+    val audioTrack: Boolean,
+    val videoSamples: Int,
+    val audioSamples: Int
+) {
+    /** For example "finalise failed after 9m12s (audio track, 0 audio samples, 16000 video samples)". */
+    fun summary(): String {
+        val what = reason.lowercase().replace('_', ' ')
+        val after = if (recordedMs > 0) " after ${formatDuration(recordedMs)}" else ""
+        val tracks = if (audioTrack) "audio track, $audioSamples audio samples" else "no audio track"
+        return "$what$after ($tracks, $videoSamples video samples)"
+    }
+
+    private fun formatDuration(ms: Long): String {
+        val s = ms / 1000
+        return if (s < 60) "${s}s" else "${s / 60}m${s % 60}s"
     }
 }

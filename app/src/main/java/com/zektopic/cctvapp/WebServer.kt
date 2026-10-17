@@ -83,6 +83,8 @@ class WebServer(
     private val getWebAuthEnabled: () -> Boolean,
     /** JSON object for the diagnostic `avSkew` key; "null" when unavailable. */
     private val getAvSkewJson: () -> String = { "null" },
+    /** Clip counters and the last lost clip, spliced into /status. */
+    private val getClipStats: () -> ClipStats = { ClipStats() },
     private val recordApi: RecordApi,
     /**
      * Port to bind. Defaults to [PORT]; tests pass [EPHEMERAL_PORT] so they get a free
@@ -339,7 +341,8 @@ class WebServer(
                 "batteryLevel":${getBatteryLevel()},
                 "wifiStrength":${getWifiStrength()},
                 "webAuthEnabled":${getWebAuthEnabled()},
-                "avSkew":${getAvSkewJson()}
+                "avSkew":${getAvSkewJson()},
+                ${getClipStats().toJsonFields()}
             }""".trimIndent()
             return newFixedLengthResponse(Response.Status.OK, "application/json", json)
         }
